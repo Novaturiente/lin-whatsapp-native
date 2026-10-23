@@ -1,0 +1,564 @@
+// Package wa connects to WhatsApp through whatsmeow and keeps the store in
+// step with it. It knows nothing about GTK; the window listens to OnEvent.
+package wa
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWeb"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
+
+	"lin-whatsapp-native/media"
+	"lin-whatsapp-native/store"
+)
+
+type EventKind int
+
+const (
+	EvQR        EventKind = iota // QR holds the code to show
+	EvConnected                  // logged in and online
+	EvLoggedOut                  // the phone unlinked this device
+	EvMessage                    // a new message in Chat; Notify set if it should alert
+	EvUpdate                     // message ID in Chat changed: status, edit, delete, reaction, vote
+	EvChats                      // chat list changed in bulk: history sync, names
+	EvTyping                     // Typing tells whether Sender is composing in Chat
+	EvError                      // Text says what failed, for the user
+)
+
+type Event struct {
+	Kind     EventKind
+	Chat, ID string
+	Sender   string
+	QR       string
+	Typing   bool
+	Text     string
+	Notify   *store.Message
+}
+
+type Client struct {
+	WA      *whatsmeow.Client
+	Store   *store.Store
+	Dir     string      // media files
+	OnEvent func(Event) // called from whatsmeow's goroutines
+
+	mu       sync.Mutex
+	names    map[string]string
+	asked    map[string]bool // groups whose name was requested
+	fetching map[string][]func(string, error)
+}
+
+// Open loads the linked device from dir, or prepares a new one to pair.
+func Open(ctx context.Context, dir string, st *store.Store) (*Client, error) {
+	container, err := sqlstore.New(ctx, "sqlite", "file:"+filepath.Join(dir, "wa.db")+
+		"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
+		waLog.Stdout("db", "WARN", true))
+	if err != nil {
+		return nil, err
+	}
+	device, err := container.GetFirstDevice(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c := &Client{
+		WA: whatsmeow.NewClient(device, waLog.Stdout("wa", "WARN", true)), Store: st,
+		Dir: filepath.Join(dir, "media"), names: map[string]string{}, asked: map[string]bool{},
+		fetching: map[string][]func(string, error){},
+	}
+	c.WA.AddEventHandler(c.handle)
+	return c, os.MkdirAll(c.Dir, 0o700)
+}
+
+// Connect logs in, first pairing by QR code if this device is new.
+func (c *Client) Connect(ctx context.Context) error {
+	if c.WA.Store.ID != nil {
+		return c.WA.Connect()
+	}
+	qr, err := c.WA.GetQRChannel(ctx)
+	if err != nil {
+		return err
+	}
+	if err := c.WA.Connect(); err != nil {
+		return err
+	}
+	go func() {
+		for item := range qr {
+			if item.Event == whatsmeow.QRChannelEventCode {
+				c.OnEvent(Event{Kind: EvQR, QR: item.Code})
+			}
+		}
+	}()
+	return nil
+}
+
+func (c *Client) Me() types.JID {
+	if c.WA.Store.ID == nil {
+		return types.EmptyJID
+	}
+	return c.WA.Store.ID.ToNonAD()
+}
+
+// normalize gives one JID per person: WhatsApp addresses some chats by a
+// hidden LID and others by phone number, which would split them in two.
+func (c *Client) normalize(ctx context.Context, j types.JID) types.JID {
+	j = j.ToNonAD()
+	if j.Server == types.HiddenUserServer {
+		if pn, err := c.WA.Store.LIDs.GetPNForLID(ctx, j); err == nil && !pn.IsEmpty() {
+			return pn.ToNonAD()
+		}
+	}
+	return j
+}
+
+func (c *Client) handle(raw any) {
+	ctx := context.Background()
+	switch e := raw.(type) {
+	case *events.Message:
+		c.message(ctx, e, true)
+	case *events.HistorySync:
+		c.history(ctx, e)
+	case *events.Receipt:
+		c.receipt(ctx, e)
+	case *events.ChatPresence:
+		c.OnEvent(Event{Kind: EvTyping, Chat: c.normalize(ctx, e.Chat).String(),
+			Sender: c.normalize(ctx, e.Sender).String(), Typing: e.State == types.ChatPresenceComposing})
+	case *events.Connected:
+		_ = c.WA.SendPresence(ctx, types.PresenceUnavailable) // the window says when it is looked at
+		c.OnEvent(Event{Kind: EvConnected})
+	case *events.LoggedOut:
+		c.OnEvent(Event{Kind: EvLoggedOut})
+	case *events.PushName, *events.Contact, *events.BusinessName:
+		c.forgetNames()
+	case *events.GroupInfo:
+		if e.Name != nil {
+			_ = c.Store.SetChatName(e.JID.String(), e.Name.Name)
+			c.forgetNames()
+		}
+	case *events.JoinedGroup:
+		_ = c.Store.SetChatName(e.JID.String(), e.GroupInfo.Name)
+		c.forgetNames()
+	case *events.MarkChatAsRead:
+		if e.Action.GetRead() {
+			_ = c.Store.SetUnread(c.normalize(ctx, e.JID).String(), 0)
+			c.OnEvent(Event{Kind: EvChats})
+		}
+	}
+}
+
+func (c *Client) forgetNames() {
+	c.mu.Lock()
+	c.names = map[string]string{}
+	c.mu.Unlock()
+	c.OnEvent(Event{Kind: EvChats})
+}
+
+// skip is true for chats this client does not show: status updates,
+// channels and our own broadcast-list sends.
+func skip(chat types.JID) bool {
+	return chat == types.StatusBroadcastJID || chat.Server == types.NewsletterServer ||
+		chat.Server == types.BroadcastServer
+}
+
+func (c *Client) message(ctx context.Context, e *events.Message, live bool) {
+	if skip(e.Info.Chat) {
+		return
+	}
+	chat := c.normalize(ctx, e.Info.Chat).String()
+	sender := c.normalize(ctx, e.Info.Sender).String()
+	if e.Info.IsFromMe {
+		sender = c.Me().String()
+	}
+	u := Convert(e, chat, sender)
+	var target string
+	switch {
+	case u.Msg != nil:
+		u.Msg.RawChat, u.Msg.RawSender = e.Info.Chat.ToNonAD().String(), e.Info.Sender.ToNonAD().String()
+		if e.SourceWebMsg != nil && u.Msg.FromMe {
+			u.Msg.Status = webStatus(e.SourceWebMsg.GetStatus())
+		}
+		if err := c.Store.AddMessage(u.Msg, live); err != nil {
+			fmt.Fprintln(os.Stderr, "store:", err)
+			return
+		}
+		if live {
+			ev := Event{Kind: EvMessage, Chat: chat, ID: u.Msg.ID}
+			if !u.Msg.FromMe {
+				ev.Notify = u.Msg
+			}
+			c.OnEvent(ev)
+		}
+		return
+	case u.React != nil:
+		_, target = c.Store.React(chat, u.React.ID, sender, u.React.Emoji), u.React.ID
+	case u.Edit != nil:
+		if !c.ownedBy(chat, u.Edit.ID, sender) {
+			return
+		}
+		_, target = c.Store.Edit(chat, u.Edit.ID, u.Edit.Text), u.Edit.ID
+	case u.Revoke != nil:
+		if !c.ownedBy(chat, u.Revoke.ID, sender) {
+			return
+		}
+		_, target = c.Store.Delete(chat, u.Revoke.ID), u.Revoke.ID
+	case u.PollVote != nil:
+		target = u.PollVote.ID
+		if err := c.vote(ctx, e, chat, sender, target); err != nil {
+			fmt.Fprintln(os.Stderr, "poll vote:", err)
+			return
+		}
+	default:
+		return
+	}
+	if live {
+		c.OnEvent(Event{Kind: EvUpdate, Chat: chat, ID: target})
+	}
+}
+
+// ownedBy reports whether sender wrote the message, so only its author can
+// edit or delete it here.
+// shortcut: a group admin deleting someone else's message is ignored; check
+// admin rights through GetGroupInfo if that matters.
+func (c *Client) ownedBy(chat, id, sender string) bool {
+	m, err := c.Store.Message(chat, id)
+	return err == nil && m != nil && m.Sender == sender
+}
+
+func (c *Client) vote(ctx context.Context, e *events.Message, chat, sender, pollID string) error {
+	v, err := c.WA.DecryptPollVote(ctx, e)
+	if err != nil {
+		return err
+	}
+	return c.storeVote(chat, pollID, sender, v)
+}
+
+func (c *Client) storeVote(chat, pollID, sender string, v *waE2E.PollVoteMessage) error {
+	poll, err := c.Store.Message(chat, pollID)
+	if err != nil || poll == nil {
+		return fmt.Errorf("poll %s not stored: %v", pollID, err)
+	}
+	hashes := whatsmeow.HashPollOptions(poll.Options)
+	var chosen []string
+	for _, sel := range v.GetSelectedOptions() {
+		for i, h := range hashes {
+			if bytes.Equal(sel, h) {
+				chosen = append(chosen, poll.Options[i])
+			}
+		}
+	}
+	return c.Store.Vote(chat, pollID, sender, chosen)
+}
+
+func webStatus(s waWeb.WebMessageInfo_Status) int {
+	switch s {
+	case waWeb.WebMessageInfo_ERROR:
+		return store.StatusFailed
+	case waWeb.WebMessageInfo_PENDING:
+		return store.StatusPending
+	case waWeb.WebMessageInfo_DELIVERY_ACK:
+		return store.StatusDelivered
+	case waWeb.WebMessageInfo_READ, waWeb.WebMessageInfo_PLAYED:
+		return store.StatusRead
+	}
+	return store.StatusSent
+}
+
+// history stores the old messages the phone sends after pairing, and later
+// in smaller batches. They never notify and never count as unread; the
+// conversation's own unread count is taken instead.
+func (c *Client) history(ctx context.Context, e *events.HistorySync) {
+	for _, conv := range e.Data.GetConversations() {
+		jid, err := types.ParseJID(conv.GetID())
+		if err != nil || skip(jid) {
+			continue
+		}
+		chat := c.normalize(ctx, jid).String()
+		_ = c.Store.SetChatName(chat, conv.GetName())
+		// History arrives newest first; store oldest first so edits and
+		// deletes find the message they refer to.
+		msgs := conv.GetMessages()
+		for i := len(msgs) - 1; i >= 0; i-- {
+			wm := msgs[i].GetMessage()
+			evt, err := c.WA.ParseWebMessage(jid, wm)
+			if err != nil {
+				continue
+			}
+			c.message(ctx, evt, false)
+			id := wm.GetKey().GetID()
+			for _, r := range wm.GetReactions() {
+				_ = c.Store.React(chat, id, c.keySender(ctx, r.GetKey().GetFromMe(), r.GetKey().GetParticipant(), r.GetKey().GetRemoteJID()), r.GetText())
+			}
+			for _, p := range wm.GetPollUpdates() {
+				k := p.GetPollUpdateMessageKey()
+				_ = c.storeVote(chat, id, c.keySender(ctx, k.GetFromMe(), k.GetParticipant(), k.GetRemoteJID()), p.GetVote())
+			}
+		}
+		if n := conv.GetUnreadCount(); n > 0 {
+			_ = c.Store.SetUnread(chat, int(n))
+		}
+	}
+	c.OnEvent(Event{Kind: EvChats})
+}
+
+// keySender is who a message key says sent something, normalised.
+func (c *Client) keySender(ctx context.Context, fromMe bool, participant, remote string) string {
+	if fromMe {
+		return c.Me().String()
+	}
+	if participant == "" {
+		participant = remote
+	}
+	j, err := types.ParseJID(participant)
+	if err != nil {
+		return participant
+	}
+	return c.normalize(ctx, j).String()
+}
+
+// receipt moves our sent messages along: sent, delivered, read.
+// shortcut: in groups the first member's receipt sets the tick, where
+// WhatsApp waits for all of them; track per member if it misleads.
+func (c *Client) receipt(ctx context.Context, e *events.Receipt) {
+	chat := c.normalize(ctx, e.Chat).String()
+	if e.Type == types.ReceiptTypeReadSelf { // read on the phone
+		_ = c.Store.SetUnread(chat, 0)
+		c.OnEvent(Event{Kind: EvChats})
+		return
+	}
+	status := map[types.ReceiptType]int{
+		types.ReceiptTypeDelivered: store.StatusDelivered,
+		types.ReceiptTypeRead:      store.StatusRead,
+		types.ReceiptTypePlayed:    store.StatusRead,
+	}[e.Type]
+	if status == 0 {
+		return
+	}
+	for _, id := range e.MessageIDs {
+		_ = c.Store.SetStatus(chat, id, status)
+		c.OnEvent(Event{Kind: EvUpdate, Chat: chat, ID: id})
+	}
+}
+
+// Name is how a person or group is shown: the phone's contact name, then
+// their own push name, then the number.
+func (c *Client) Name(jid string) string {
+	c.mu.Lock()
+	n, ok := c.names[jid]
+	c.mu.Unlock()
+	if ok {
+		return n
+	}
+	j, err := types.ParseJID(jid)
+	if err != nil {
+		return jid
+	}
+	ctx := context.Background()
+	j = c.normalize(ctx, j)
+	switch {
+	case j.User == c.Me().User:
+		n = "You"
+	case j.Server == types.GroupServer:
+		n = c.groupName(ctx, j)
+	default:
+		info, _ := c.WA.Store.Contacts.GetContact(ctx, j)
+		for _, v := range []string{info.FullName, info.FirstName, info.PushName, info.BusinessName} {
+			if v != "" {
+				n = v
+				break
+			}
+		}
+		if n == "" && j.Server == types.DefaultUserServer {
+			n = "+" + j.User
+		} else if n == "" {
+			n = info.RedactedPhone
+		}
+		if n == "" {
+			n = j.User
+		}
+	}
+	if n != "Group" { // a placeholder must not stick
+		c.mu.Lock()
+		c.names[jid] = n
+		c.mu.Unlock()
+	}
+	return n
+}
+
+// groupName answers from the store; an unknown group is looked up in the
+// background, because Name runs on the UI thread.
+func (c *Client) groupName(ctx context.Context, j types.JID) string {
+	chats, _ := c.Store.Chats()
+	for _, ch := range chats {
+		if ch.JID == j.String() && ch.Name != "" {
+			return ch.Name
+		}
+	}
+	c.mu.Lock()
+	asked := c.asked[j.String()]
+	c.asked[j.String()] = true
+	c.mu.Unlock()
+	if asked { // once per run; a group we left never answers
+		return "Group"
+	}
+	go func() {
+		if info, err := c.WA.GetGroupInfo(ctx, j); err == nil && info.Name != "" {
+			_ = c.Store.SetChatName(j.String(), info.Name)
+			c.forgetNames()
+		}
+	}()
+	return "Group"
+}
+
+// Members lists a group's participants for @mentions, by phone-number JID.
+func (c *Client) Members(chat string) []string {
+	j, err := types.ParseJID(chat)
+	if err != nil || j.Server != types.GroupServer {
+		return nil
+	}
+	info, err := c.WA.GetGroupInfo(context.Background(), j)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range info.Participants {
+		pj := p.JID
+		if !p.PhoneNumber.IsEmpty() {
+			pj = p.PhoneNumber
+		}
+		if pj.User != c.Me().User {
+			out = append(out, c.normalize(context.Background(), pj).String())
+		}
+	}
+	return out
+}
+
+// MarkRead sends read receipts for a chat's unread messages.
+func (c *Client) MarkRead(chat string) {
+	chats, _ := c.Store.Chats()
+	unread := 0
+	for _, ch := range chats {
+		if ch.JID == chat {
+			unread = ch.Unread
+		}
+	}
+	if unread == 0 {
+		return
+	}
+	_ = c.Store.SetUnread(chat, 0)
+	msgs, _ := c.Store.Unread(chat, unread)
+	// One receipt per address the messages came in on, as WhatsApp keyed them.
+	type addr struct{ chat, sender string }
+	by := map[addr][]string{}
+	for _, m := range msgs {
+		if m.RawChat == "" { // sent before raw JIDs were kept
+			m.RawChat, m.RawSender = m.Chat, m.Sender
+		}
+		a := addr{m.RawChat, m.RawSender}
+		by[a] = append(by[a], m.ID)
+	}
+	for a, ids := range by {
+		cj, sj := jid(a.chat), jid(a.sender)
+		if cj.Server != types.GroupServer {
+			sj = types.EmptyJID
+		}
+		go c.WA.MarkRead(context.Background(), ids, time.Now(), cj, sj)
+	}
+}
+
+// Fetch downloads a message's media once and calls done with its path. Files
+// are named by content hash, so a sticker seen in ten chats is stored once.
+// done runs on a background goroutine.
+func (c *Client) Fetch(m *store.Message, done func(string, error)) {
+	if m.Media != "" {
+		if _, err := os.Stat(m.Media); err == nil {
+			done(m.Media, nil)
+			return
+		}
+	}
+	if len(m.Raw) == 0 {
+		done("", fmt.Errorf("no media"))
+		return
+	}
+	key := m.Chat + "/" + m.ID
+	c.mu.Lock()
+	waiting, busy := c.fetching[key]
+	c.fetching[key] = append(waiting, done)
+	c.mu.Unlock()
+	if busy {
+		return
+	}
+	go func() {
+		path, err := c.download(m)
+		if err == nil {
+			_ = c.Store.SetMedia(m.Chat, m.ID, path)
+		}
+		c.mu.Lock()
+		list := c.fetching[key]
+		delete(c.fetching, key)
+		c.mu.Unlock()
+		for _, f := range list {
+			f(path, err)
+		}
+	}()
+}
+
+func (c *Client) download(m *store.Message) (string, error) {
+	var msg waE2E.Message
+	if err := proto.Unmarshal(m.Raw, &msg); err != nil {
+		return "", err
+	}
+	data, err := c.WA.DownloadAny(context.Background(), &msg)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	path := filepath.Join(c.Dir, hex.EncodeToString(sum[:16])+media.Ext(m.Mime, m.FileName))
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+	tmp, err := os.CreateTemp(c.Dir, "*.part") // the same sticker may download twice at once
+	if err != nil {
+		return "", err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	tmp.Close()
+	return path, os.Rename(tmp.Name(), path)
+}
+
+// Avatar downloads a chat's profile picture thumbnail, or returns "".
+func (c *Client) Avatar(chat string) string {
+	j, err := types.ParseJID(chat)
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(c.Dir, "avatar-"+strings.ReplaceAll(j.User, ":", "_")+".jpg")
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	info, err := c.WA.GetProfilePictureInfo(context.Background(), j, &whatsmeow.GetProfilePictureParams{Preview: true})
+	if err != nil || info == nil {
+		return ""
+	}
+	data, err := media.Get(info.URL) // plain HTTPS, not encrypted media
+	if err != nil || os.WriteFile(path, data, 0o600) != nil {
+		return ""
+	}
+	return path
+}

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WhatsApp (native)
+GenericName=Messenger
+Comment=WhatsApp chats without a browser engine
+Exec=/home/nova/personal/lin-whatsapp-native/lin-whatsapp-native
+Icon=/home/nova/personal/lin-whatsapp/icon.svg
+Terminal=false
+Categories=Network;InstantMessaging;
+Keywords=whatsapp;chat;messenger;
+StartupWMClass=io.github.nova.LinWhatsappNative
+StartupNotify=true
