@@ -7,32 +7,47 @@ draws with GTK4 and libadwaita. Chats only: no calls, status or channels.
 whatsmeow is unofficial. Using it breaks WhatsApp's terms of service, and a
 ban, while rare, is possible.
 
-## Build
+## Install
+
+Linux x86_64. Installs to `~/.local/bin` with a launcher entry; no root needed.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Novaturiente/lin-whatsapp-native/master/install.sh | sh
+```
+
+**Update:** run the same command again. Your chats and login are kept.
+
+**Uninstall:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Novaturiente/lin-whatsapp-native/master/install.sh | sh -s -- --uninstall
+```
+
+### Requirements
+
+- `gtk4` and `libadwaita` 1.5 or newer (Arch: `sudo pacman -S gtk4 libadwaita`).
+- Optional: `gst-launch-1.0` with `pipewiresrc` and `opusenc` (voice notes),
+  `ffmpeg`/`ffprobe` (video previews and durations), `notify-send`
+  (notifications).
+
+## Build from source
 
 ```sh
 go build -o lin-whatsapp-native .
 ```
 
 The first build compiles the GTK bindings and takes about 13 minutes. Later
-builds take seconds. Runtime tools: `gst-launch-1.0` with `pipewiresrc` and
-`opusenc` (voice notes), `ffmpeg`/`ffprobe` (video previews and durations),
-`notify-send`.
+builds take seconds.
 
 ## Run
 
-```sh
-./lin-whatsapp-native
-```
+Start **WhatsApp (native)** from your app launcher, or run
+`~/.local/bin/lin-whatsapp-native` (`./lin-whatsapp-native` in a source
+checkout).
 
 Scan the QR code from your phone under Settings, Linked devices. The phone
 then sends part of your history; older chats may be missing, as with any
 newly linked device.
-
-Install the launcher:
-
-```sh
-cp lin-whatsapp-native.desktop ~/.local/share/applications/
-```
 
 Data lives in `~/.local/share/lin-whatsapp-native/`: `wa.db` holds the
 device keys (delete it to unlink), `chat.db` the messages, `media/` the
