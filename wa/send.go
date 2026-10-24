@@ -48,6 +48,13 @@ func (c *Client) quote(reply *store.Message, mentions []string) *waE2E.ContextIn
 // send stores msg as pending in chat, then delivers it. localMedia, when
 // set, is the file the message was made from, so it shows without a download.
 func (c *Client) send(chat string, msg *waE2E.Message, localMedia string) {
+	id, msg := c.pending(chat, msg, localMedia)
+	c.transmit(chat, id, msg)
+}
+
+// pending stores msg as a pending message in chat and returns its ID and
+// the message as it will go out.
+func (c *Client) pending(chat string, msg *waE2E.Message, localMedia string) (string, *waE2E.Message) {
 	if ch, _ := c.Store.Chat(chat); ch.Ephemeral > 0 {
 		msg = withExpiration(msg, ch.Ephemeral)
 	}
@@ -60,7 +67,7 @@ func (c *Client) send(chat string, msg *waE2E.Message, localMedia string) {
 		_ = c.Store.AddMessage(u.Msg, false)
 		c.OnEvent(Event{Kind: EvMessage, Chat: chat, ID: id})
 	}
-	c.transmit(chat, id, msg)
+	return id, msg
 }
 
 // transmit sends with a fixed ID. A failed message stays in outbox so Retry
@@ -70,20 +77,23 @@ func (c *Client) transmit(chat, id string, msg *waE2E.Message) {
 	c.mu.Lock()
 	c.outbox[id] = msg
 	c.mu.Unlock()
-	go func() {
-		_, err := c.WA.SendMessage(context.Background(), jid(chat), msg, whatsmeow.SendRequestExtra{ID: id})
-		status := store.StatusSent
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "send:", err)
-			status = store.StatusFailed
-		} else {
-			c.mu.Lock()
-			delete(c.outbox, id)
-			c.mu.Unlock()
-		}
-		_ = c.Store.SetStatus(chat, id, status)
-		c.OnEvent(Event{Kind: EvUpdate, Chat: chat, ID: id})
-	}()
+	go c.deliver(chat, id, msg)
+}
+
+// deliver sends one message and records the outcome. It blocks.
+func (c *Client) deliver(chat, id string, msg *waE2E.Message) {
+	_, err := c.WA.SendMessage(context.Background(), jid(chat), msg, whatsmeow.SendRequestExtra{ID: id})
+	status := store.StatusSent
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "send:", err)
+		status = store.StatusFailed
+	} else {
+		c.mu.Lock()
+		delete(c.outbox, id)
+		c.mu.Unlock()
+	}
+	_ = c.Store.SetStatus(chat, id, status)
+	c.OnEvent(Event{Kind: EvUpdate, Chat: chat, ID: id})
 }
 
 // Retry sends a failed message again. After a restart the outbox is empty,
@@ -275,15 +285,49 @@ func (c *Client) SendSticker(chat string, sticker *store.Message, reply *store.M
 	return nil
 }
 
-// Forward sends a stored message to another chat without uploading again.
-func (c *Client) Forward(to string, m *store.Message) error {
+// Forward sends stored messages to another chat without uploading again,
+// one after another so they arrive in order.
+func (c *Client) Forward(to string, msgs ...*store.Message) error {
+	type item struct {
+		msg   *waE2E.Message
+		local string
+	}
+	var items []item
+	for _, m := range msgs { // build all first: a bad one sends none
+		msg, err := forwardable(m)
+		if err != nil {
+			return err
+		}
+		items = append(items, item{msg, m.Media})
+	}
+	type queued struct {
+		id  string
+		msg *waE2E.Message
+	}
+	var out []queued
+	for _, it := range items {
+		id, msg := c.pending(to, it.msg, it.local)
+		c.mu.Lock()
+		c.outbox[id] = msg
+		c.mu.Unlock()
+		out = append(out, queued{id, msg})
+	}
+	go func() {
+		for _, q := range out {
+			c.deliver(to, q.id, q.msg)
+		}
+	}()
+	return nil
+}
+
+// forwardable is m as a message to send on, marked forwarded where WhatsApp shows it.
+func forwardable(m *store.Message) (*waE2E.Message, error) {
 	if len(m.Raw) == 0 {
-		c.SendText(to, m.Text, nil, nil)
-		return nil
+		return &waE2E.Message{Conversation: proto.String(m.Text)}, nil
 	}
 	var msg waE2E.Message
 	if err := proto.Unmarshal(m.Raw, &msg); err != nil {
-		return err
+		return nil, err
 	}
 	ci := &waE2E.ContextInfo{IsForwarded: proto.Bool(true), ForwardingScore: proto.Uint32(1)}
 	switch {
@@ -300,8 +344,7 @@ func (c *Client) Forward(to string, m *store.Message) error {
 	case msg.StickerMessage != nil:
 		msg.StickerMessage.ContextInfo = ci
 	}
-	c.send(to, &msg, m.Media)
-	return nil
+	return &msg, nil
 }
 
 func (c *Client) SendPoll(chat, question string, options []string, multi bool) {

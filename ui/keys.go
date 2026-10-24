@@ -23,11 +23,13 @@ const shortcutsHelp = `Panes
   Alt+↑ / Alt+↓           previous / next chat
   Ctrl+K                  search chats (↓ then Enter opens)
   Ctrl+,                  settings
+  Ctrl+I                  chat or group info
   Ctrl+= / Ctrl+- / Ctrl+0  bigger / smaller / default text
 
 Chat list
   ↑ ↓ or k j, g G         move          Enter, o or l   open
   /                       search chats
+  m or Menu               pin, mute, archive, info
   Ctrl+Alt+N              new chat
   Ctrl+F or / (messages)  search in this chat (Enter older, Shift+Enter newer)
 
@@ -39,6 +41,7 @@ Messages pane
   c or Ctrl+C             copy text      s   save file
   f                       forward        x   delete yours for everyone
   m or Menu               all actions, reactions included
+  space                   select for copy, forward or delete (Esc clears)
   i or Esc                back to the message box
 
 Message box
@@ -85,6 +88,10 @@ func (w *Window) windowKey(keyval uint, state gdk.ModifierType) bool {
 		w.zoom(0)
 	case ctrl && !alt && keyval == gdk.KEY_f:
 		w.conv.openSearch()
+	case ctrl && keyval == gdk.KEY_i:
+		if w.conv.chat != "" {
+			w.chatInfo(w.conv.chat)
+		}
 	case ctrl && alt && (keyval == gdk.KEY_n || keyval == gdk.KEY_N):
 		w.newChat()
 	case alt && keyval == gdk.KEY_1:
@@ -147,7 +154,7 @@ func (w *Window) focusChats(search bool) {
 	}
 	if r := w.chats.rows[w.conv.chat]; r != nil {
 		r.row.GrabFocus()
-	} else if row := w.chats.list.RowAtIndex(0); row != nil {
+	} else if row := w.chats.firstVisible(); row != nil {
 		row.GrabFocus()
 	}
 }
@@ -156,7 +163,7 @@ func (w *Window) focusChats(search bool) {
 func (w *Window) stepChat(d int) {
 	r := w.chats.rows[w.conv.chat]
 	if r == nil {
-		if row := w.chats.list.RowAtIndex(0); row != nil {
+		if row := w.chats.firstVisible(); row != nil {
 			w.openChat(row.Name())
 		}
 		return
@@ -290,8 +297,20 @@ func (c *Conversation) messagesKey(keyval uint, state gdk.ModifierType) bool {
 		c.moveCursor(c.firstSlot())
 	case gdk.KEY_End, gdk.KEY_G:
 		c.moveCursor(c.lastSlot())
-	case gdk.KEY_i, gdk.KEY_Escape:
-		c.composer.focus()
+	case gdk.KEY_Escape:
+		if len(c.picked) > 0 {
+			c.clearPicks()
+		} else {
+			c.composer.focus()
+		}
+	case gdk.KEY_i:
+		if len(c.picked) == 0 {
+			c.composer.focus()
+		}
+	case gdk.KEY_space:
+		if m := c.cursorMessage(); m != nil {
+			c.pick(m.ID)
+		}
 	case gdk.KEY_slash:
 		c.openSearch()
 	default:
@@ -302,6 +321,23 @@ func (c *Conversation) messagesKey(keyval uint, state gdk.ModifierType) bool {
 
 // actOnCursor runs a one-letter action on the message under the cursor.
 func (c *Conversation) actOnCursor(keyval uint) bool {
+	if len(c.picked) > 0 { // the picked messages, not the cursor's
+		switch keyval {
+		case gdk.KEY_c:
+			c.copyPicks()
+		case gdk.KEY_f:
+			if c.pickForward.Sensitive() {
+				c.forward(c.forwardable()...)
+			}
+		case gdk.KEY_x, gdk.KEY_Delete:
+			if c.pickDelete.Sensitive() {
+				c.confirmDelete(c.pickedMessages()...)
+			}
+		default:
+			return false
+		}
+		return true
+	}
 	m := c.cursorMessage()
 	if m == nil || m.Kind == store.KindSystem {
 		return false

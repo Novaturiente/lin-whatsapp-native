@@ -54,12 +54,19 @@ type Conversation struct {
 	phoneEnd    bool // the phone answered with nothing older
 	composer    *Composer
 	typers      map[string]time.Time
+
+	picked      map[string]bool // messages picked for a bulk action, by ID
+	pickBar     *gtk.ActionBar
+	pickLabel   *gtk.Label
+	pickCopy    *gtk.Button
+	pickForward *gtk.Button
+	pickDelete  *gtk.Button
 }
 
 func newConversation(w *Window) *Conversation {
 	c := &Conversation{w: w, root: adw.NewToolbarView(), title: adw.NewWindowTitle("", ""),
 		stack: gtk.NewStack(), scroll: gtk.NewScrolledWindow(), box: gtk.NewBox(gtk.OrientationVertical, 4),
-		slots: map[string]*gtk.Box{}, typers: map[string]time.Time{}}
+		slots: map[string]*gtk.Box{}, typers: map[string]time.Time{}, picked: map[string]bool{}}
 	header := adw.NewHeaderBar()
 	c.avatar = adw.NewAvatar(32, "", true)
 	header.PackStart(c.avatar)
@@ -69,6 +76,14 @@ func newConversation(w *Window) *Conversation {
 	find := gtk.NewButtonFromIconName("system-search-symbolic")
 	find.SetTooltipText("Search messages (Ctrl+F or /)")
 	find.ConnectClicked(c.openSearch)
+	info := gtk.NewButtonFromIconName("help-about-symbolic")
+	info.SetTooltipText("Chat info (Ctrl+I)")
+	info.ConnectClicked(func() {
+		if c.chat != "" {
+			w.chatInfo(c.chat)
+		}
+	})
+	header.PackEnd(info)
 	header.PackEnd(find)
 
 	c.box.SetMarginStart(12)
@@ -103,6 +118,7 @@ func newConversation(w *Window) *Conversation {
 	c.stack.AddNamed(c.scroll, "chat")
 	c.root.SetContent(c.stack)
 
+	c.root.AddBottomBar(c.buildPickBar())
 	c.composer = newComposer(c)
 	c.root.AddBottomBar(c.composer.root)
 	c.composer.root.SetVisible(false)
@@ -139,6 +155,8 @@ func (c *Conversation) open(chat string) {
 	}
 	c.slots = map[string]*gtk.Box{}
 	c.clamps = nil
+	c.picked = map[string]bool{}
+	c.pickBar.SetRevealed(false)
 	c.stack.SetVisibleChildName("chat")
 	c.composer.root.SetVisible(true)
 	c.composer.reset()
@@ -342,6 +360,13 @@ func (c *Conversation) update(id string) {
 		slot.Remove(old)
 	}
 	slot.Append(c.bubble(m))
+	if c.picked[id] {
+		if m.Deleted {
+			delete(c.picked, id)
+			slot.RemoveCSSClass("picked")
+		}
+		c.pickChanged() // what the bar allows may have changed
+	}
 }
 
 // resizeBubbles caps bubbles at the Settings share of the pane's width.
@@ -386,6 +411,20 @@ func (c *Conversation) slot(m *store.Message, runStart bool) *gtk.Box {
 	}
 	slot.Append(c.bubble(m))
 	c.slots[m.ID] = slot
+	if c.picked[m.ID] {
+		slot.AddCSSClass("picked")
+	}
+	// While messages are picked, a click picks instead of opening anything.
+	click := gtk.NewGestureClick()
+	click.SetPropagationPhase(gtk.PhaseCapture)
+	id := m.ID
+	click.ConnectPressed(func(int, float64, float64) {
+		if len(c.picked) > 0 {
+			click.SetState(gtk.EventSequenceClaimed)
+			c.pick(id)
+		}
+	})
+	slot.AddController(click)
 	return slot
 }
 
@@ -658,6 +697,9 @@ func (c *Conversation) meta(m *store.Message) gtk.Widgetter {
 	}
 	if m.Edited && !m.Deleted {
 		t = "edited  " + t
+	}
+	if m.Starred {
+		t = "★  " + t
 	}
 	text := glib.MarkupEscapeText(t)
 	if m.FromMe {

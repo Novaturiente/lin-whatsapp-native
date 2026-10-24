@@ -140,6 +140,9 @@ func (c *Client) normalize(ctx context.Context, j types.JID) types.JID {
 
 func (c *Client) handle(raw any) {
 	ctx := context.Background()
+	if c.appState(ctx, raw) {
+		return
+	}
 	switch e := raw.(type) {
 	case *events.Message:
 		c.message(ctx, e, true)
@@ -152,6 +155,7 @@ func (c *Client) handle(raw any) {
 			Sender: c.normalize(ctx, e.Sender).String(), Typing: e.State == types.ChatPresenceComposing})
 	case *events.Connected:
 		_ = c.WA.SendPresence(ctx, types.PresenceUnavailable) // the window says when it is looked at
+		c.fillFlags(ctx)
 		c.OnEvent(Event{Kind: EvConnected})
 		c.OnEvent(Event{Kind: EvConnection})
 	case *events.KeepAliveRestored:
@@ -273,7 +277,9 @@ func (c *Client) message(ctx context.Context, e *events.Message, live bool) {
 			if !u.Msg.FromMe {
 				c.mu.Lock()
 				if c.catchingUp {
-					c.missed[chat]++
+					if ch, _ := c.Store.Chat(chat); !ch.Muted() {
+						c.missed[chat]++
+					}
 				} else {
 					ev.Notify = u.Msg
 				}
@@ -418,6 +424,9 @@ func (c *Client) history(ctx context.Context, e *events.HistorySync) {
 			}
 			c.message(ctx, evt, false)
 			id := wm.GetKey().GetID()
+			if wm.GetStarred() { // a Star event may have come before the message was stored
+				_ = c.Store.SetStarred(chat, id, true)
+			}
 			for _, r := range wm.GetReactions() {
 				_ = c.Store.React(chat, id, c.keySender(ctx, r.GetKey().GetFromMe(), r.GetKey().GetParticipant(), r.GetKey().GetRemoteJID()), r.GetText())
 			}
@@ -429,6 +438,8 @@ func (c *Client) history(ctx context.Context, e *events.HistorySync) {
 		if n := conv.GetUnreadCount(); n > 0 {
 			_ = c.Store.SetUnread(chat, int(n))
 		}
+		// after the messages: flags never create a chat row
+		c.historyFlags(chat, conv.GetArchived(), conv.GetPinned(), conv.GetMuteEndTime())
 		if e.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
 			c.OnEvent(Event{Kind: EvHistory, Chat: chat})
 		}
@@ -624,7 +635,11 @@ func (c *Client) receipt(ctx context.Context, e *events.Receipt) {
 	if status == 0 {
 		return
 	}
+	member := c.normalize(ctx, e.Sender).String()
 	for _, id := range e.MessageIDs {
+		if !e.IsFromMe { // from the person it was sent to, for Message info
+			_ = c.Store.AddReceipt(chat, id, member, status, e.Timestamp)
+		}
 		_ = c.Store.SetStatus(chat, id, status)
 		c.OnEvent(Event{Kind: EvUpdate, Chat: chat, ID: id})
 	}
@@ -700,24 +715,49 @@ func (c *Client) groupName(ctx context.Context, j types.JID) string {
 	return "Group"
 }
 
-// Members lists a group's participants for @mentions, by phone-number JID.
-func (c *Client) Members(chat string) []string {
+type Member struct {
+	JID   string // by phone number where known
+	Admin bool
+}
+
+type Group struct {
+	Name, Topic string
+	Created     time.Time
+	Members     []Member // ourselves included
+}
+
+// Group asks the server for a group's details. It blocks: call it off the UI thread.
+func (c *Client) Group(chat string) (*Group, error) {
 	j, err := types.ParseJID(chat)
 	if err != nil || j.Server != types.GroupServer {
-		return nil
+		return nil, fmt.Errorf("not a group")
 	}
-	info, err := c.WA.GetGroupInfo(context.Background(), j)
+	ctx := context.Background()
+	info, err := c.WA.GetGroupInfo(ctx, j)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	var out []string
+	g := &Group{Name: info.Name, Topic: info.Topic, Created: info.GroupCreated}
 	for _, p := range info.Participants {
 		pj := p.JID
 		if !p.PhoneNumber.IsEmpty() {
 			pj = p.PhoneNumber
 		}
-		if pj.User != c.Me().User {
-			out = append(out, c.normalize(context.Background(), pj).String())
+		g.Members = append(g.Members, Member{c.normalize(ctx, pj).String(), p.IsAdmin || p.IsSuperAdmin})
+	}
+	return g, nil
+}
+
+// Members lists a group's participants for @mentions, by phone-number JID.
+func (c *Client) Members(chat string) []string {
+	g, err := c.Group(chat)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, m := range g.Members {
+		if jid(m.JID).User != c.Me().User {
+			out = append(out, m.JID)
 		}
 	}
 	return out

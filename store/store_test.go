@@ -89,6 +89,49 @@ func TestSystemLinesStayOutOfReceipts(t *testing.T) {
 	}
 }
 
+func TestChatFlags(t *testing.T) {
+	s := open(t)
+	c := "1@s.whatsapp.net"
+	s.AddMessage(msg("a", 1, "hi"), false)
+	s.SetPinned(c, 5)
+	s.SetMuted(c, -1)
+	if ch, _ := s.Chat(c); ch.Pinned != 5 || !ch.Muted() || ch.Archived {
+		t.Fatalf("pin and mute: %+v", ch)
+	}
+	s.SetArchived(c, true)
+	s.SetMuted(c, time.Now().Add(-time.Hour).UnixMilli())
+	if ch, _ := s.Chat(c); ch.Pinned != 0 || ch.Muted() || !ch.Archived {
+		t.Fatalf("archive unpins, past mute ends: %+v", ch)
+	}
+	s.SetStarred(c, "a", true)
+	if got, _ := s.Starred(10); len(got) != 1 || !got[0].Starred {
+		t.Fatalf("starred: %+v", got)
+	}
+	s.SetArchived("new@s.whatsapp.net", true)
+	if chats, _ := s.Chats(); len(chats) != 1 {
+		t.Fatalf("a flag created a chat: %+v", chats)
+	}
+}
+
+func TestReceipts(t *testing.T) {
+	s := open(t)
+	c := "g@g.us"
+	s.AddReceipt(c, "m", "a", StatusRead, time.UnixMilli(30)) // a read can come before its delivery
+	s.AddReceipt(c, "m", "a", StatusDelivered, time.UnixMilli(10))
+	s.AddReceipt(c, "m", "b", StatusDelivered, time.UnixMilli(20))
+	s.AddReceipt(c, "m", "a", StatusRead, time.UnixMilli(50)) // played after read: keeps the first
+	got, err := s.Receipts(c, "m")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("%v %+v", err, got)
+	}
+	if a := got[0]; a.Member != "a" || a.Delivered.UnixMilli() != 10 || a.Read.UnixMilli() != 30 {
+		t.Fatalf("reader first, earliest times: %+v", a)
+	}
+	if b := got[1]; b.Member != "b" || !b.Read.IsZero() {
+		t.Fatalf("delivered only: %+v", b)
+	}
+}
+
 func TestSearch(t *testing.T) {
 	s := open(t)
 	c := "1@s.whatsapp.net"

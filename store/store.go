@@ -70,18 +70,33 @@ type Message struct {
 	Forwarded          bool
 	// Link preview carried by the message; Thumb holds its picture.
 	LinkURL, LinkTitle, LinkDesc string
+	Starred                      bool
 }
 
 type Chat struct {
-	JID       string
-	Name      string
-	LastTime  time.Time
-	LastText  string
-	Unread    int
-	Ephemeral uint32 // disappearing-messages timer in seconds, 0 when off
+	JID        string
+	Name       string
+	LastTime   time.Time
+	LastText   string
+	Unread     int
+	Ephemeral  uint32 // disappearing-messages timer in seconds, 0 when off
+	Archived   bool
+	Pinned     int64 // when it was pinned, unix ms; 0 when not pinned
+	MutedUntil int64 // unix ms; -1 mutes for good, 0 is not muted
+}
+
+// Muted reports whether the chat's notifications are off right now.
+func (c Chat) Muted() bool {
+	return c.MutedUntil == -1 || c.MutedUntil > time.Now().UnixMilli()
 }
 
 type Reaction struct{ Sender, Emoji string }
+
+// Receipt is when one member got and read a message we sent; zero when not (yet) known.
+type Receipt struct {
+	Member          string
+	Delivered, Read time.Time
+}
 
 type Store struct{ db *sql.DB }
 
@@ -143,6 +158,15 @@ var migrations = []string{
 	UPDATE chats SET last_text = COALESCE((SELECT text FROM messages m WHERE m.chat = chats.jid
 		AND m.deleted = 0 ORDER BY ts DESC, rowid DESC LIMIT 1), '')
 	WHERE last_text IN ('Unsupported message', '');`,
+	`ALTER TABLE chats ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE chats ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE chats ADD COLUMN muted_until INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE messages ADD COLUMN starred INTEGER NOT NULL DEFAULT 0;`,
+	// who got and read each message we sent, for Message info
+	`CREATE TABLE receipts (
+		chat TEXT NOT NULL, msg_id TEXT NOT NULL, member TEXT NOT NULL,
+		delivered_ts INTEGER NOT NULL DEFAULT 0, read_ts INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (chat, msg_id, member));`,
 }
 
 func migrate(db *sql.DB) error {
@@ -255,21 +279,21 @@ func (s *Store) AddMessage(m *Message, countUnread bool) error {
 
 const cols = `rowid, chat, id, sender, from_me, ts, kind, text, file_name, mime, voice, animated,
 	view_once, thumb, raw, media, options, multi_vote, quote_id, quote_sender, quote_text,
-	mentions, status, edited, deleted, raw_chat, raw_sender, forwarded, link_url, link_title, link_desc`
+	mentions, status, edited, deleted, raw_chat, raw_sender, forwarded, link_url, link_title, link_desc, starred`
 
 func scan(row interface{ Scan(...any) error }) (*Message, error) {
 	var m Message
 	var ts int64
-	var fromMe, voice, animated, viewOnce, multi, edited, deleted, forwarded int
+	var fromMe, voice, animated, viewOnce, multi, edited, deleted, forwarded, starred int
 	var options, mentions string
 	err := row.Scan(&m.Seq, &m.Chat, &m.ID, &m.Sender, &fromMe, &ts, &m.Kind, &m.Text, &m.FileName,
 		&m.Mime, &voice, &animated, &viewOnce, &m.Thumb, &m.Raw, &m.Media, &options, &multi,
 		&m.QuoteID, &m.QuoteSender, &m.QuoteText, &mentions, &m.Status, &edited, &deleted,
-		&m.RawChat, &m.RawSender, &forwarded, &m.LinkURL, &m.LinkTitle, &m.LinkDesc)
+		&m.RawChat, &m.RawSender, &forwarded, &m.LinkURL, &m.LinkTitle, &m.LinkDesc, &starred)
 	if err != nil {
 		return nil, err
 	}
-	m.Forwarded = forwarded == 1
+	m.Forwarded, m.Starred = forwarded == 1, starred == 1
 	m.Time = time.UnixMilli(ts)
 	m.FromMe, m.Voice, m.Animated, m.ViewOnce = fromMe == 1, voice == 1, animated == 1, viewOnce == 1
 	m.MultiVote, m.Edited, m.Deleted = multi == 1, edited == 1, deleted == 1
@@ -376,23 +400,52 @@ func (s *Store) Stickers(limit int) ([]*Message, error) {
 	return out, rows.Err()
 }
 
+const chatCols = `jid, name, last_ts, last_text, unread, ephemeral, archived, pinned, muted_until`
+
+func scanChat(row interface{ Scan(...any) error }) (Chat, error) {
+	var c Chat
+	var ts int64
+	var archived int
+	err := row.Scan(&c.JID, &c.Name, &ts, &c.LastText, &c.Unread, &c.Ephemeral, &archived, &c.Pinned, &c.MutedUntil)
+	c.LastTime, c.Archived = time.UnixMilli(ts), archived == 1
+	return c, err
+}
+
 func (s *Store) Chats() ([]Chat, error) {
-	rows, err := s.db.Query(`SELECT jid, name, last_ts, last_text, unread, ephemeral FROM chats ORDER BY last_ts DESC`)
+	rows, err := s.db.Query(`SELECT ` + chatCols + ` FROM chats ORDER BY last_ts DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Chat
 	for rows.Next() {
-		var c Chat
-		var ts int64
-		if err := rows.Scan(&c.JID, &c.Name, &ts, &c.LastText, &c.Unread, &c.Ephemeral); err != nil {
+		c, err := scanChat(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.LastTime = time.UnixMilli(ts)
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// SetArchived archives or unarchives a chat; archiving also unpins it, as
+// WhatsApp does. Like the other chat flags it never creates a chat row.
+func (s *Store) SetArchived(jid string, archived bool) error {
+	_, err := s.db.Exec(`UPDATE chats SET archived = ?,
+		pinned = CASE WHEN ? = 1 THEN 0 ELSE pinned END WHERE jid = ?`, b2i(archived), b2i(archived), jid)
+	return err
+}
+
+// SetPinned pins a chat as of at (unix ms), or unpins it with 0.
+func (s *Store) SetPinned(jid string, at int64) error {
+	_, err := s.db.Exec(`UPDATE chats SET pinned = ? WHERE jid = ?`, at, jid)
+	return err
+}
+
+// SetMuted mutes a chat until (unix ms; -1 for good), or unmutes it with 0.
+func (s *Store) SetMuted(jid string, until int64) error {
+	_, err := s.db.Exec(`UPDATE chats SET muted_until = ? WHERE jid = ?`, until, jid)
+	return err
 }
 
 // SetChatName records a name; an empty one never overwrites a known one.
@@ -407,14 +460,10 @@ func (s *Store) SetChatName(jid, name string) error {
 
 // Chat returns one chat; a chat never stored comes back empty with its JID.
 func (s *Store) Chat(jid string) (Chat, error) {
-	c := Chat{JID: jid}
-	var ts int64
-	err := s.db.QueryRow(`SELECT name, last_ts, last_text, unread, ephemeral FROM chats WHERE jid = ?`, jid).
-		Scan(&c.Name, &ts, &c.LastText, &c.Unread, &c.Ephemeral)
+	c, err := scanChat(s.db.QueryRow(`SELECT `+chatCols+` FROM chats WHERE jid = ?`, jid))
 	if errors.Is(err, sql.ErrNoRows) {
-		return c, nil
+		return Chat{JID: jid}, nil
 	}
-	c.LastTime = time.UnixMilli(ts)
 	return c, err
 }
 
@@ -473,6 +522,48 @@ func (s *Store) SetStatus(chat, id string, status int) error {
 	return err
 }
 
+// AddReceipt records that member got (StatusDelivered) or read (StatusRead)
+// a message at a time. A read implies delivery; the first time of each is kept.
+func (s *Store) AddReceipt(chat, id, member string, status int, at time.Time) error {
+	ms := at.UnixMilli()
+	read := int64(0)
+	if status == StatusRead {
+		read = ms
+	}
+	_, err := s.db.Exec(`INSERT INTO receipts VALUES (?,?,?,?,?)
+		ON CONFLICT (chat, msg_id, member) DO UPDATE SET
+		delivered_ts = CASE WHEN delivered_ts = 0 THEN excluded.delivered_ts ELSE min(delivered_ts, excluded.delivered_ts) END,
+		read_ts = CASE WHEN read_ts = 0 THEN excluded.read_ts WHEN excluded.read_ts = 0 THEN read_ts
+			ELSE min(read_ts, excluded.read_ts) END`, chat, id, member, ms, read)
+	return err
+}
+
+// Receipts lists who got a message, readers first.
+func (s *Store) Receipts(chat, id string) ([]Receipt, error) {
+	rows, err := s.db.Query(`SELECT member, delivered_ts, read_ts FROM receipts
+		WHERE chat = ? AND msg_id = ? ORDER BY read_ts = 0, read_ts, delivered_ts`, chat, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Receipt
+	for rows.Next() {
+		var r Receipt
+		var d, rd int64
+		if err := rows.Scan(&r.Member, &d, &rd); err != nil {
+			return nil, err
+		}
+		if d > 0 {
+			r.Delivered = time.UnixMilli(d)
+		}
+		if rd > 0 {
+			r.Read = time.UnixMilli(rd)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ResetStatus puts a failed message back to pending for a retry.
 func (s *Store) ResetStatus(chat, id string) error {
 	_, err := s.db.Exec(`UPDATE messages SET status = ? WHERE chat = ? AND id = ?`, StatusPending, chat, id)
@@ -483,6 +574,30 @@ func (s *Store) ResetStatus(chat, id string) error {
 func (s *Store) SetThumb(chat, id string, jpg []byte) error {
 	_, err := s.db.Exec(`UPDATE messages SET thumb = ? WHERE chat = ? AND id = ?`, jpg, chat, id)
 	return err
+}
+
+func (s *Store) SetStarred(chat, id string, on bool) error {
+	_, err := s.db.Exec(`UPDATE messages SET starred = ? WHERE chat = ? AND id = ?`, b2i(on), chat, id)
+	return err
+}
+
+// Starred returns starred messages from every chat, newest first.
+func (s *Store) Starred(limit int) ([]*Message, error) {
+	rows, err := s.db.Query(`SELECT `+cols+` FROM messages WHERE starred = 1 AND deleted = 0
+		ORDER BY ts DESC, rowid DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Message
+	for rows.Next() {
+		m, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) SetMedia(chat, id, path string) error {

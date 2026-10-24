@@ -22,12 +22,14 @@ type ChatList struct {
 	list   *gtk.ListBox
 	// Rows are found by their GTK widget name, which holds the chat JID:
 	// gotk4 hands each signal a new Go wrapper, so row pointers never match.
-	rows    map[string]*chatRow
-	pending bool
-	avatars map[string]*gdk.Texture // chat JID to picture; nil while unknown
-	asked   map[string]bool
-	sem     chan struct{}            // profile picture downloads in flight
-	waiters map[string][]*adw.Avatar // avatars elsewhere waiting for a picture
+	rows       map[string]*chatRow
+	pending    bool
+	title      *adw.WindowTitle
+	archiveBtn *gtk.ToggleButton       // shows archived chats instead of the rest
+	avatars    map[string]*gdk.Texture // chat JID to picture; nil while unknown
+	asked      map[string]bool
+	sem        chan struct{}            // profile picture downloads in flight
+	waiters    map[string][]*adw.Avatar // avatars elsewhere waiting for a picture
 }
 
 // chatRow is one chat's row and what it was last drawn from, so a refresh
@@ -35,6 +37,7 @@ type ChatList struct {
 type chatRow struct {
 	row    *gtk.ListBoxRow
 	chat   store.Chat
+	muted  bool // as drawn: a mute ends with the clock, not with a store change
 	name   string
 	avatar bool
 }
@@ -45,7 +48,23 @@ func newChatList(w *Window) *ChatList {
 		waiters: map[string][]*adw.Avatar{},
 		sem:     make(chan struct{}, 3)}
 	header := adw.NewHeaderBar()
-	header.SetTitleWidget(adw.NewWindowTitle("WhatsApp", ""))
+	l.title = adw.NewWindowTitle("WhatsApp", "")
+	header.SetTitleWidget(l.title)
+	l.archiveBtn = gtk.NewToggleButton()
+	l.archiveBtn.SetIconName("folder-symbolic")
+	l.archiveBtn.SetTooltipText("Archived chats")
+	l.archiveBtn.SetVisible(false)
+	l.archiveBtn.ConnectToggled(func() {
+		if l.archiveBtn.Active() {
+			l.title.SetTitle("Archived")
+		} else {
+			l.title.SetTitle("WhatsApp")
+		}
+		l.list.InvalidateFilter()
+	})
+	starred := gtk.NewButtonFromIconName("starred-symbolic")
+	starred.SetTooltipText("Starred messages")
+	starred.ConnectClicked(w.showStarred)
 	newChat := gtk.NewButtonFromIconName("document-edit-symbolic")
 	newChat.SetTooltipText("New chat (Ctrl+Alt+N)")
 	newChat.ConnectClicked(w.newChat)
@@ -53,7 +72,9 @@ func newChatList(w *Window) *ChatList {
 	prefs.SetTooltipText("Settings (Ctrl+,)")
 	prefs.ConnectClicked(w.openSettings)
 	header.PackStart(prefs)
+	header.PackStart(starred)
 	header.PackEnd(newChat)
+	header.PackEnd(l.archiveBtn)
 	l.root.AddTopBar(header)
 
 	l.search.SetPlaceholderText("Search chats")
@@ -102,6 +123,10 @@ func newChatList(w *Window) *ChatList {
 			}
 		case gdk.KEY_slash:
 			l.search.GrabFocus()
+		case gdk.KEY_m, gdk.KEY_Menu:
+			if f := l.list.FocusChild(); f != nil {
+				l.menu(gtk.BaseWidget(f).Name(), 40, 20)
+			}
 		default:
 			return false
 		}
@@ -111,12 +136,21 @@ func newChatList(w *Window) *ChatList {
 	l.list.SetFilterFunc(func(row *gtk.ListBoxRow) bool {
 		q := strings.ToLower(l.search.Text())
 		r := l.rows[row.Name()]
-		return q == "" || r != nil && strings.Contains(strings.ToLower(r.name), q)
+		if r == nil {
+			return false
+		}
+		if q == "" { // a search looks in archived chats too
+			return r.chat.Archived == l.archiveBtn.Active()
+		}
+		return strings.Contains(strings.ToLower(r.name), q)
 	})
 	l.list.SetSortFunc(func(a, b *gtk.ListBoxRow) int {
 		ra, rb := l.rows[a.Name()], l.rows[b.Name()]
 		if ra == nil || rb == nil {
 			return 0
+		}
+		if ra.chat.Pinned != rb.chat.Pinned { // pinned on top, last pinned first
+			return int(min(max(rb.chat.Pinned-ra.chat.Pinned, -1), 1))
 		}
 		return rb.chat.LastTime.Compare(ra.chat.LastTime) // newest first
 	})
@@ -161,22 +195,32 @@ func (l *ChatList) rebuild() {
 	}
 	seen := map[string]bool{}
 	changed := false
-	unread := 0
+	unread, archived := 0, 0
 	for _, c := range chats {
 		seen[c.JID] = true
-		unread += c.Unread
+		if !c.Muted() {
+			unread += c.Unread
+		}
+		if c.Archived {
+			archived++
+		}
 		name := l.w.c.Name(c.JID)
 		hasAvatar := l.avatar(c.JID) != nil
 		r := l.rows[c.JID]
 		if r == nil {
 			r = &chatRow{row: gtk.NewListBoxRow()}
 			r.row.SetName(c.JID)
+			jid := c.JID
+			click := gtk.NewGestureClick()
+			click.SetButton(gdk.BUTTON_SECONDARY)
+			click.ConnectPressed(func(_ int, x, y float64) { l.menu(jid, x, y) })
+			r.row.AddController(click)
 			l.rows[c.JID] = r
 			l.list.Append(r.row)
-		} else if r.chat == c && r.name == name && r.avatar == hasAvatar {
+		} else if r.chat == c && r.name == name && r.avatar == hasAvatar && r.muted == c.Muted() {
 			continue
 		}
-		r.chat, r.name, r.avatar = c, name, hasAvatar
+		r.chat, r.name, r.avatar, r.muted = c, name, hasAvatar, c.Muted()
 		r.row.SetChild(l.rowContent(c, name))
 		changed = true
 	}
@@ -191,6 +235,8 @@ func (l *ChatList) rebuild() {
 		l.list.InvalidateSort()
 		l.list.InvalidateFilter()
 	}
+	l.archiveBtn.SetVisible(archived > 0 || l.archiveBtn.Active())
+	l.archiveBtn.SetTooltipText(fmt.Sprintf("Archived chats (%d)", archived))
 	title := "WhatsApp"
 	if unread > 0 {
 		title = fmt.Sprintf("(%d) WhatsApp", unread)
@@ -224,9 +270,18 @@ func (l *ChatList) rowContent(c store.Chat, name string) gtk.Widgetter {
 	preview.AddCSSClass("dim-label")
 	bottom := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	bottom.Append(preview)
+	if c.Muted() {
+		bottom.Append(dimIcon("audio-volume-muted-symbolic", "Muted"))
+	}
+	if c.Pinned != 0 {
+		bottom.Append(dimIcon("view-pin-symbolic", "Pinned"))
+	}
 	if c.Unread > 0 {
 		badge := gtk.NewLabel(strconv.Itoa(c.Unread))
 		badge.AddCSSClass("unread")
+		if c.Muted() {
+			badge.AddCSSClass("muted")
+		}
 		bottom.Append(badge)
 	}
 	text := gtk.NewBox(gtk.OrientationVertical, 4)
@@ -241,6 +296,63 @@ func (l *ChatList) rowContent(c store.Chat, name string) gtk.Widgetter {
 	row.Append(avatar)
 	row.Append(text)
 	return row
+}
+
+func dimIcon(name, tip string) *gtk.Image {
+	i := gtk.NewImageFromIconName(name)
+	i.AddCSSClass("dim-label")
+	i.SetTooltipText(tip)
+	return i
+}
+
+// menu is the right-click popover on a chat: pin, mute, archive, info.
+func (l *ChatList) menu(jid string, x, y float64) {
+	r := l.rows[jid]
+	if r == nil {
+		return
+	}
+	c, wc := r.chat, l.w.c
+	pop := gtk.NewPopover()
+	pop.SetParent(r.row)
+	at := gdk.NewRectangle(int(x), int(y), 1, 1)
+	pop.SetPointingTo(&at)
+	pop.ConnectClosed(func() { glib.IdleAdd(pop.Unparent) })
+	col := gtk.NewBox(gtk.OrientationVertical, 2)
+	pop.SetChild(col)
+	act := func(label string, f func()) {
+		b := gtk.NewButtonWithLabel(label)
+		b.AddCSSClass("flat")
+		b.Child().(*gtk.Label).SetXAlign(0)
+		b.ConnectClicked(func() { pop.Popdown(); f() })
+		col.Append(b)
+	}
+	act("Chat info", func() { l.w.chatInfo(jid) })
+	pinned := 0
+	for _, o := range l.rows {
+		if o.chat.Pinned != 0 {
+			pinned++
+		}
+	}
+	switch {
+	case c.Archived:
+	case c.Pinned != 0:
+		act("Unpin", func() { wc.Pin(jid, false) })
+	case pinned < 3: // WhatsApp's limit
+		act("Pin", func() { wc.Pin(jid, true) })
+	}
+	if c.Muted() {
+		act("Unmute", func() { wc.Mute(jid, false, 0) })
+	} else {
+		act("Mute for 8 hours", func() { wc.Mute(jid, true, 8*time.Hour) })
+		act("Mute for 1 week", func() { wc.Mute(jid, true, 7*24*time.Hour) })
+		act("Mute always", func() { wc.Mute(jid, true, 0) })
+	}
+	if c.Archived {
+		act("Unarchive", func() { wc.Archive(jid, false) })
+	} else {
+		act("Archive", func() { wc.Archive(jid, true) })
+	}
+	pop.Popup()
 }
 
 // avatar returns a chat's picture if it is loaded, and starts loading it

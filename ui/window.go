@@ -35,6 +35,8 @@ searchbar.chat-search > revealer > box { padding: 4px 8px; }
 .reactions { font-size: small; padding: 1px 6px; border-radius: 10px; background: alpha(@window_fg_color, .08); }
 .unread { background: @accent_bg_color; color: @accent_fg_color; border-radius: 10px;
 	padding: 0 6px; font-size: small; font-weight: bold; }
+.unread.muted { background: alpha(@window_fg_color, .3); color: @window_bg_color; }
+.slot.picked { background: alpha(@accent_bg_color, .22); }
 .conversation { background: alpha(@window_fg_color, .03); }
 .system { font-size: small; padding: 3px 10px; margin: 4px 0; border-radius: 8px;
 	background: alpha(@window_fg_color, .07); opacity: .85; }
@@ -169,7 +171,9 @@ func (w *Window) dispatch(e wa.Event) {
 			}
 		}
 		if e.Notify != nil && (!w.win.IsActive() || e.Chat != w.conv.chat) {
-			w.notify(e)
+			if ch, _ := w.c.Store.Chat(e.Chat); !ch.Muted() {
+				w.notify(e)
+			}
 		}
 	case wa.EvMissed:
 		if !w.win.IsActive() {

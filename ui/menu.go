@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"slices"
 	"time"
 
@@ -69,6 +70,15 @@ func (c *Conversation) menu(anchor *gtk.Box, m *store.Message, x, y float64) {
 		})
 	}
 	act("Reply", func() { c.composer.replyTo(m) })
+	if m.Starred {
+		act("Unstar", func() { c.w.c.Star(m, false) })
+	} else {
+		act("Star", func() { c.w.c.Star(m, true) })
+	}
+	if m.FromMe {
+		act("Message info", func() { c.w.messageInfo(m) })
+	}
+	act("Select", func() { c.pick(m.ID) })
 	if m.Text != "" && m.Kind != store.KindPoll {
 		act("Copy text", func() { anchor.Clipboard().SetText(m.Text) })
 	}
@@ -92,13 +102,13 @@ func (c *Conversation) menu(anchor *gtk.Box, m *store.Message, x, y float64) {
 	if len(m.Raw) > 0 {
 		act("Save to Downloads", func() { c.save(m) })
 	}
-	if len(m.Raw) > 0 || (m.Text != "" && !m.ViewOnce && m.Kind != store.KindOther && m.Kind != store.KindPoll) {
+	if canForward(m) {
 		act("Forward…", func() { c.forward(m) })
 	}
 	if m.FromMe && m.Kind == store.KindText && time.Since(m.Time) < 15*time.Minute {
 		act("Edit", func() { c.composer.edit(m) })
 	}
-	if m.FromMe && time.Since(m.Time) < 48*time.Hour {
+	if canRevoke(m) {
 		act("Delete for everyone", func() { c.confirmDelete(m) })
 	}
 	pop.Popup()
@@ -133,21 +143,32 @@ func (c *Conversation) copyImage(m *store.Message) {
 	})
 }
 
-func (c *Conversation) confirmDelete(m *store.Message) {
-	d := adw.NewAlertDialog("Delete for everyone?", "The message is removed from this chat on every device.")
+func (c *Conversation) confirmDelete(msgs ...*store.Message) {
+	title, body := "Delete for everyone?", "The message is removed from this chat on every device."
+	if len(msgs) > 1 {
+		title = fmt.Sprintf("Delete %d messages for everyone?", len(msgs))
+		body = "The messages are removed from this chat on every device."
+	}
+	d := adw.NewAlertDialog(title, body)
 	d.AddResponse("cancel", "Cancel")
 	d.AddResponse("delete", "Delete")
 	d.SetResponseAppearance("delete", adw.ResponseDestructive)
 	d.ConnectResponse(func(r string) {
 		if r == "delete" {
-			c.w.c.Revoke(m)
+			for _, m := range msgs {
+				c.w.c.Revoke(m)
+			}
+			c.clearPicks()
 		}
 	})
 	d.Present(c.w.win)
 }
 
-// forward asks for a chat and sends the message there.
-func (c *Conversation) forward(m *store.Message) {
+// forward asks for a chat and sends the messages there, oldest first.
+func (c *Conversation) forward(msgs ...*store.Message) {
+	if len(msgs) == 0 {
+		return
+	}
 	d := adw.NewAlertDialog("Forward to…", "")
 	d.AddResponse("cancel", "Cancel")
 	search := gtk.NewSearchEntry()
@@ -170,10 +191,11 @@ func (c *Conversation) forward(m *store.Message) {
 	list.SetFilterFunc(func(row *gtk.ListBoxRow) bool { return contains(at(names, row), search.Text()) })
 	search.ConnectSearchChanged(list.InvalidateFilter)
 	list.ConnectRowActivated(func(row *gtk.ListBoxRow) {
-		if err := c.w.c.Forward(at(jids, row), m); err != nil {
+		if err := c.w.c.Forward(at(jids, row), msgs...); err != nil {
 			c.w.toast("Could not forward: " + err.Error())
 		} else {
 			c.w.toast("Forwarded to " + at(names, row))
+			c.clearPicks()
 		}
 		d.Close()
 	})
