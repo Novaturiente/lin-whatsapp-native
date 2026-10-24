@@ -35,7 +35,7 @@ Messages pane
   PgUp PgDn, g G          page, first / last
   Enter or o              open photo, video or file; jump to quoted message
   r                       reply          e   edit yours
-  c                       copy text      s   save file
+  c or Ctrl+C             copy text      s   save file
   f                       forward        x   delete yours for everyone
   m or Menu               all actions, reactions included
   i or Esc                back to the message box
@@ -70,6 +70,8 @@ func (w *Window) windowKey(keyval uint, state gdk.ModifierType) bool {
 	switch {
 	case ctrl && (keyval == gdk.KEY_q || keyval == gdk.KEY_w):
 		w.win.Close()
+	case ctrl && !shift && keyval == gdk.KEY_c:
+		return w.conv.copySelection()
 	case ctrl && keyval == gdk.KEY_k:
 		w.focusChats(true)
 	case ctrl && keyval == gdk.KEY_comma:
@@ -334,6 +336,26 @@ func (c *Conversation) actOnCursor(keyval uint) bool {
 		return false
 	}
 	return true
+}
+
+// copySelection copies text selected in a message, or else the message
+// under the cursor when the messages pane has focus. It reports false to
+// leave Ctrl+C to the focused widget (the message box, a search entry).
+func (c *Conversation) copySelection() bool {
+	if c.composer.view.HasFocus() && c.composer.view.Buffer().HasSelection() {
+		return false
+	}
+	if l := c.selLabel; l != nil && l.Parent() != nil {
+		if start, end, ok := l.SelectionBounds(); ok && start != end {
+			r := []rune(l.Text()) // offsets are in characters
+			c.box.Clipboard().SetText(string(r[min(start, end):max(start, end)]))
+			return true
+		}
+	}
+	if c.scroll.HasFocus() {
+		return c.actOnCursor(gdk.KEY_c)
+	}
+	return false
 }
 
 // --- search in chat -------------------------------------------------------

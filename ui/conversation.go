@@ -42,6 +42,7 @@ type Conversation struct {
 	cursor     *gtk.Box     // the message the keyboard acts on
 	lastSender string       // sender of the newest bubble shown, for avatar runs
 	menuOpen   bool         // a message menu is up; the pane's letter keys stand down
+	selLabel   *gtk.Label   // last message text pressed; Ctrl+C copies its selection
 	clamps     []*adw.Clamp // every shown bubble's width cap, resized with the pane
 	bubbleMax  int          // that cap: Settings.BubbleWidth % of the pane's width
 
@@ -488,6 +489,10 @@ func (c *Conversation) textLabel(m *store.Message) *gtk.Label {
 	l.SetWrapMode(pango.WrapWordChar)
 	l.SetSelectable(true)
 	l.SetCanFocus(false)   // selectable labels grab focus and select all
+	press := gtk.NewGestureClick() // unfocused labels miss their own Ctrl+C; see copySelection
+	press.SetPropagationPhase(gtk.PhaseCapture)
+	press.ConnectPressed(func(int, float64, float64) { c.selLabel = l })
+	l.AddController(press)
 	l.SetMaxWidthChars(-1) // natural width is the whole line; the bubble's clamp caps it
 	return l
 }
