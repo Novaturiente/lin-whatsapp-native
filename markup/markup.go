@@ -46,6 +46,19 @@ func Pango(text string, mentions []string, name func(jid string) string) string 
 	return out.String()
 }
 
+// Links lists the links in text as they were written, without duplicates.
+func Links(text string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, u := range link.FindAllString(text, -1) {
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
 func plain(s string, tagged map[string]string, name func(string) string) string {
 	s = html.EscapeString(s)
 	for _, st := range styles {

@@ -21,3 +21,10 @@ func TestPango(t *testing.T) {
 		}
 	}
 }
+
+func TestLinks(t *testing.T) {
+	got := Links("see https://a.com/x, www.b.org and https://a.com/x.")
+	if len(got) != 2 || got[0] != "https://a.com/x" || got[1] != "www.b.org" {
+		t.Errorf("got %q", got)
+	}
+}

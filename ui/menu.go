@@ -1,13 +1,16 @@
 package ui
 
 import (
+	"slices"
 	"time"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
+	"github.com/diamondburned/gotk4/pkg/pango"
 
+	"lin-whatsapp-native/markup"
 	"lin-whatsapp-native/media"
 	"lin-whatsapp-native/store"
 )
@@ -34,7 +37,10 @@ func (c *Conversation) menu(anchor *gtk.Box, m *store.Message, x, y float64) {
 	act := func(label string, f func()) {
 		b := gtk.NewButtonWithLabel(label)
 		b.AddCSSClass("flat")
-		b.Child().(*gtk.Label).SetXAlign(0)
+		l := b.Child().(*gtk.Label)
+		l.SetXAlign(0)
+		l.SetMaxWidthChars(40)
+		l.SetEllipsize(pango.EllipsizeMiddle)
 		b.ConnectClicked(func() { pop.Popdown(); f() })
 		col.Append(b)
 	}
@@ -65,6 +71,20 @@ func (c *Conversation) menu(anchor *gtk.Box, m *store.Message, x, y float64) {
 	act("Reply", func() { c.composer.replyTo(m) })
 	if m.Text != "" && m.Kind != store.KindPoll {
 		act("Copy text", func() { anchor.Clipboard().SetText(m.Text) })
+	}
+	links := markup.Links(m.Text)
+	if m.LinkURL != "" && !slices.Contains(links, m.LinkURL) {
+		links = append(links, m.LinkURL)
+	}
+	for i, u := range links {
+		label := "Copy link"
+		if len(links) > 1 {
+			label = "Copy link: " + u
+		}
+		if i == 3 { // a message full of links must not make the menu endless
+			break
+		}
+		act(label, func() { anchor.Clipboard().SetText(u); c.w.toast("Link copied") })
 	}
 	if m.Kind == store.KindImage || m.Kind == store.KindSticker {
 		act("Copy image", func() { c.copyImage(m) })
