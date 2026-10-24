@@ -4,7 +4,6 @@ package ui
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -22,10 +21,8 @@ import (
 const css = `
 .bubble { padding: 6px 10px; border-radius: 12px; }
 .bubble.in { background: alpha(@card_bg_color, 1); box-shadow: 0 1px 1px alpha(black, .08); }
-.bubble.out { background: #005c4b; color: #e9edef; }
 .bubble.out .quote { background: alpha(black, .18); }
 .bubble.out .meta { opacity: .75; }
-.bubble { font-size: 11.5pt; }
 .bubble label { line-height: 1.35; }
 .slot { border-radius: 8px; transition: background 500ms ease-out; }
 .slot.flash { background: alpha(@accent_bg_color, .35); transition: none; }
@@ -58,8 +55,8 @@ window.main banner > revealer > widget {
 window.main headerbar { border-bottom: 1px solid alpha(@window_fg_color, .08); }
 `
 
-// opacity is LINWA_OPACITY (0.3 to 1): how solid the window background is.
-// 1 turns transparency off.
+// opacity is LINWA_OPACITY (0.3 to 1), the default background opacity
+// until Settings saves one. 1 turns transparency off.
 func opacity() float64 {
 	v, err := strconv.ParseFloat(os.Getenv("LINWA_OPACITY"), 64)
 	if err != nil {
@@ -78,18 +75,18 @@ type Window struct {
 	chats  *ChatList
 	conv   *Conversation
 	qr     *gtk.Picture
+	set    Settings
+	style  *gtk.CSSProvider // generated from set; see applySettings
 }
 
 func New(app *adw.Application, c *wa.Client) *Window {
 	provider := gtk.NewCSSProvider()
-	style := css
-	if o := opacity(); o < 1 {
-		style += fmt.Sprintf(transparentCSS, o)
-	}
-	provider.LoadFromString(style)
+	provider.LoadFromString(css)
 	gtk.StyleContextAddProviderForDisplay(gdk.DisplayGetDefault(), provider, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-	w := &Window{win: adw.NewApplicationWindow(&app.Application), c: c}
+	w := &Window{win: adw.NewApplicationWindow(&app.Application), c: c,
+		set: loadSettings(), style: gtk.NewCSSProvider()}
+	gtk.StyleContextAddProviderForDisplay(gdk.DisplayGetDefault(), w.style, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION+1)
 	w.win.SetTitle("WhatsApp")
 	w.win.AddCSSClass("main")
 	w.win.SetDefaultSize(1100, 760)
@@ -126,6 +123,7 @@ func New(app *adw.Application, c *wa.Client) *Window {
 		}
 	})
 	w.bindKeys()
+	w.applySettings()
 	c.OnEvent = func(e wa.Event) { glib.IdleAdd(func() { w.dispatch(e) }) }
 	return w
 }

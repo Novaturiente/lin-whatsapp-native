@@ -48,6 +48,10 @@ func newChatList(w *Window) *ChatList {
 	newChat := gtk.NewButtonFromIconName("document-edit-symbolic")
 	newChat.SetTooltipText("New chat (Ctrl+Alt+N)")
 	newChat.ConnectClicked(w.newChat)
+	prefs := gtk.NewButtonFromIconName("emblem-system-symbolic")
+	prefs.SetTooltipText("Settings (Ctrl+,)")
+	prefs.ConnectClicked(w.openSettings)
+	header.PackStart(prefs)
 	header.PackEnd(newChat)
 	l.root.AddTopBar(header)
 

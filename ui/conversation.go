@@ -43,7 +43,7 @@ type Conversation struct {
 	lastSender string       // sender of the newest bubble shown, for avatar runs
 	menuOpen   bool         // a message menu is up; the pane's letter keys stand down
 	clamps     []*adw.Clamp // every shown bubble's width cap, resized with the pane
-	bubbleMax  int          // that cap: 75% of the pane's width
+	bubbleMax  int          // that cap: Settings.BubbleWidth % of the pane's width
 
 	searchBar   *gtk.SearchBar
 	searchEntry *gtk.SearchEntry
@@ -88,17 +88,7 @@ func newConversation(w *Window) *Conversation {
 	// GTK has no percentage widths: follow the pane's width through its
 	// horizontal adjustment, whose page size is the visible width.
 	c.bubbleMax = 560
-	c.scroll.HAdjustment().ConnectChanged(func() {
-		max := int(c.scroll.HAdjustment().PageSize() * 0.75)
-		if max < 200 || max == c.bubbleMax {
-			return
-		}
-		c.bubbleMax = max
-		for _, cl := range c.clamps {
-			cl.SetMaximumSize(max)
-			cl.SetTighteningThreshold(max)
-		}
-	})
+	c.scroll.HAdjustment().ConnectChanged(c.resizeBubbles)
 	c.scroll.VAdjustment().ConnectValueChanged(func() {
 		if c.scroll.VAdjustment().Value() < 300 {
 			c.loadOlder()
@@ -352,6 +342,19 @@ func (c *Conversation) update(id string) {
 	slot.Append(c.bubble(m))
 }
 
+// resizeBubbles caps bubbles at the Settings share of the pane's width.
+func (c *Conversation) resizeBubbles() {
+	max := int(c.scroll.HAdjustment().PageSize() * float64(c.w.set.BubbleWidth) / 100)
+	if max < 200 || max == c.bubbleMax {
+		return
+	}
+	c.bubbleMax = max
+	for _, cl := range c.clamps {
+		cl.SetMaximumSize(max)
+		cl.SetTighteningThreshold(max)
+	}
+}
+
 // sender is who a run of bubbles belongs to; notice lines break runs.
 func sender(m *store.Message) string {
 	if m.Kind == store.KindSystem {
@@ -430,7 +433,7 @@ func (c *Conversation) bubble(m *store.Message) gtk.Widgetter {
 	c.content(col, m)
 	col.Append(c.meta(m))
 
-	// A bubble grows with its text up to 75% of the pane, then wraps.
+	// A bubble grows with its text up to Settings.BubbleWidth % of the pane, then wraps.
 	clamp := adw.NewClamp()
 	clamp.SetMaximumSize(c.bubbleMax)
 	clamp.SetTighteningThreshold(c.bubbleMax)

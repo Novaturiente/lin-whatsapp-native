@@ -22,6 +22,7 @@ const shortcutsHelp = `Panes
   F6, Shift+F6            next / previous pane
   Alt+↑ / Alt+↓           previous / next chat
   Ctrl+K                  search chats (↓ then Enter opens)
+  Ctrl+,                  settings
 
 Chat list
   ↑ ↓ or k j, g G         move          Enter, o or l   open
@@ -71,6 +72,8 @@ func (w *Window) windowKey(keyval uint, state gdk.ModifierType) bool {
 		w.win.Close()
 	case ctrl && keyval == gdk.KEY_k:
 		w.focusChats(true)
+	case ctrl && keyval == gdk.KEY_comma:
+		w.openSettings()
 	case ctrl && !alt && keyval == gdk.KEY_f:
 		w.conv.openSearch()
 	case ctrl && alt && (keyval == gdk.KEY_n || keyval == gdk.KEY_N):
