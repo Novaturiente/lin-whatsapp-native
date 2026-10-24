@@ -38,6 +38,10 @@ type Composer struct {
 	editing   *store.Message
 	typingAt  int // generation counter for the "stopped typing" timer
 	composing bool
+	// Unsent text per chat, kept while the app runs.
+	// shortcut: lost on quit; save to the store if that bites.
+	drafts    map[string]draft
+	restoring bool // a draft is being put back: not typing
 
 	members     []string          // group members, for @mentions
 	mentions    map[string]string // "@Name" inserted, to its JID
@@ -53,7 +57,7 @@ type Composer struct {
 
 func newComposer(c *Conversation) *Composer {
 	k := &Composer{c: c, root: gtk.NewBox(gtk.OrientationVertical, 4), view: gtk.NewTextView(),
-		mentions: map[string]string{}}
+		mentions: map[string]string{}, drafts: map[string]draft{}}
 	k.root.SetMarginStart(8)
 	k.root.SetMarginEnd(8)
 	k.root.SetMarginTop(6)
@@ -134,6 +138,25 @@ func newComposer(c *Conversation) *Composer {
 
 type person struct{ name, jid string }
 
+type draft struct {
+	text     string
+	mentions map[string]string
+}
+
+// keepDraft saves the box's text for the chat being left. Called before
+// the conversation switches chats; an edit in progress is not a draft.
+func (k *Composer) keepDraft() {
+	chat := k.c.chat
+	if chat == "" {
+		return
+	}
+	if text := k.text(); k.editing == nil && strings.TrimSpace(text) != "" {
+		k.drafts[chat] = draft{text, k.mentions}
+	} else {
+		delete(k.drafts, chat)
+	}
+}
+
 func (k *Composer) text() string {
 	start, end := k.view.Buffer().Bounds()
 	return k.view.Buffer().Text(start, end, false)
@@ -147,8 +170,14 @@ func (k *Composer) reset() {
 	k.cancelRecording()
 	k.reply, k.editing = nil, nil
 	k.banner.SetVisible(false)
-	k.view.Buffer().SetText("")
-	k.mentions = map[string]string{}
+	d := k.drafts[k.c.chat]
+	k.restoring = true
+	k.view.Buffer().SetText(d.text)
+	k.restoring = false
+	k.mentions = d.mentions
+	if k.mentions == nil {
+		k.mentions = map[string]string{}
+	}
 	k.members = nil
 	if chat := k.c.chat; isGroup(chat) {
 		go func() {
@@ -205,7 +234,7 @@ func (k *Composer) changed() {
 	empty := strings.TrimSpace(k.text()) == ""
 	k.send.SetVisible(!empty || k.editing != nil)
 	k.mic.SetVisible(empty && k.editing == nil && k.rec == nil)
-	if !empty {
+	if !empty && !k.restoring {
 		k.startTyping()
 	}
 	k.updateMentions()
@@ -293,6 +322,7 @@ func (k *Composer) submit() {
 	k.banner.SetVisible(false)
 	k.view.Buffer().SetText("")
 	k.mentions = map[string]string{}
+	delete(k.drafts, chat)
 	k.stopTyping()
 }
 

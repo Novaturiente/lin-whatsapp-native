@@ -128,6 +128,7 @@ func (c *Conversation) open(chat string) {
 		return
 	}
 	c.composer.stopTyping() // tell the old chat, before c.chat moves on
+	c.composer.keepDraft()
 	c.chat, c.oldest, c.typers, c.storeEnd, c.asking, c.loading = chat, nil, map[string]time.Time{}, false, nil, false
 	c.phoneEnd = false
 	c.askGen++
@@ -488,7 +489,7 @@ func (c *Conversation) textLabel(m *store.Message) *gtk.Label {
 	l.SetWrap(true)
 	l.SetWrapMode(pango.WrapWordChar)
 	l.SetSelectable(true)
-	l.SetCanFocus(false)   // selectable labels grab focus and select all
+	l.SetCanFocus(false)           // selectable labels grab focus and select all
 	press := gtk.NewGestureClick() // unfocused labels miss their own Ctrl+C; see copySelection
 	press.SetPropagationPhase(gtk.PhaseCapture)
 	press.ConnectPressed(func(int, float64, float64) { c.selLabel = l })
