@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -31,7 +32,8 @@ const (
 	KindPoll     = "poll"
 	KindLocation = "location"
 	KindContact  = "contact"
-	KindOther    = "other" // a type this client cannot show yet
+	KindOther    = "other"  // a type this client cannot show yet
+	KindSystem   = "system" // a grey centred notice: group changes, missed calls
 )
 
 type Message struct {
@@ -64,14 +66,18 @@ type Message struct {
 	// LID). Chat and Sender are normalised for display; every message key
 	// and receipt about this message must use these instead.
 	RawChat, RawSender string
+	Forwarded          bool
+	// Link preview carried by the message; Thumb holds its picture.
+	LinkURL, LinkTitle, LinkDesc string
 }
 
 type Chat struct {
-	JID      string
-	Name     string
-	LastTime time.Time
-	LastText string
-	Unread   int
+	JID       string
+	Name      string
+	LastTime  time.Time
+	LastText  string
+	Unread    int
+	Ephemeral uint32 // disappearing-messages timer in seconds, 0 when off
 }
 
 type Reaction struct{ Sender, Emoji string }
@@ -112,7 +118,43 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
-	return &Store{db}, nil
+	return &Store{db}, migrate(db)
+}
+
+// migrations change the schema above, which stays frozen: chat.db already
+// holds people's messages, so columns are only ever added. Entry i brings
+// the database to user_version i+1.
+var migrations = []string{
+	`ALTER TABLE chats ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE messages ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE messages ADD COLUMN link_url TEXT NOT NULL DEFAULT '';
+	ALTER TABLE messages ADD COLUMN link_title TEXT NOT NULL DEFAULT '';
+	ALTER TABLE messages ADD COLUMN link_desc TEXT NOT NULL DEFAULT '';`,
+}
+
+func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	for i := version; i < len(migrations); i++ {
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(migrations[i]); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration %d: %w", i+1, err)
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, i+1)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -169,13 +211,15 @@ func (s *Store) AddMessage(m *Message, countUnread bool) error {
 	defer tx.Rollback()
 	res, err := tx.Exec(`INSERT INTO messages (chat, id, sender, from_me, ts, kind, text,
 		file_name, mime, voice, animated, view_once, thumb, raw, media, options, multi_vote,
-		quote_id, quote_sender, quote_text, mentions, status, edited, deleted, raw_chat, raw_sender)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		quote_id, quote_sender, quote_text, mentions, status, edited, deleted, raw_chat, raw_sender,
+		forwarded, link_url, link_title, link_desc)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (chat, id) DO NOTHING`,
 		m.Chat, m.ID, m.Sender, b2i(m.FromMe), m.Time.UnixMilli(), m.Kind, m.Text,
 		m.FileName, m.Mime, b2i(m.Voice), b2i(m.Animated), b2i(m.ViewOnce), m.Thumb, m.Raw,
 		m.Media, js(m.Options), b2i(m.MultiVote), m.QuoteID, m.QuoteSender, m.QuoteText,
-		js(m.Mentions), m.Status, b2i(m.Edited), b2i(m.Deleted), m.RawChat, m.RawSender)
+		js(m.Mentions), m.Status, b2i(m.Edited), b2i(m.Deleted), m.RawChat, m.RawSender,
+		b2i(m.Forwarded), m.LinkURL, m.LinkTitle, m.LinkDesc)
 	if err != nil {
 		return err
 	}
@@ -198,20 +242,21 @@ func (s *Store) AddMessage(m *Message, countUnread bool) error {
 
 const cols = `rowid, chat, id, sender, from_me, ts, kind, text, file_name, mime, voice, animated,
 	view_once, thumb, raw, media, options, multi_vote, quote_id, quote_sender, quote_text,
-	mentions, status, edited, deleted, raw_chat, raw_sender`
+	mentions, status, edited, deleted, raw_chat, raw_sender, forwarded, link_url, link_title, link_desc`
 
 func scan(row interface{ Scan(...any) error }) (*Message, error) {
 	var m Message
 	var ts int64
-	var fromMe, voice, animated, viewOnce, multi, edited, deleted int
+	var fromMe, voice, animated, viewOnce, multi, edited, deleted, forwarded int
 	var options, mentions string
 	err := row.Scan(&m.Seq, &m.Chat, &m.ID, &m.Sender, &fromMe, &ts, &m.Kind, &m.Text, &m.FileName,
 		&m.Mime, &voice, &animated, &viewOnce, &m.Thumb, &m.Raw, &m.Media, &options, &multi,
 		&m.QuoteID, &m.QuoteSender, &m.QuoteText, &mentions, &m.Status, &edited, &deleted,
-		&m.RawChat, &m.RawSender)
+		&m.RawChat, &m.RawSender, &forwarded, &m.LinkURL, &m.LinkTitle, &m.LinkDesc)
 	if err != nil {
 		return nil, err
 	}
+	m.Forwarded = forwarded == 1
 	m.Time = time.UnixMilli(ts)
 	m.FromMe, m.Voice, m.Animated, m.ViewOnce = fromMe == 1, voice == 1, animated == 1, viewOnce == 1
 	m.MultiVote, m.Edited, m.Deleted = multi == 1, edited == 1, deleted == 1
@@ -297,7 +342,7 @@ func (s *Store) Stickers(limit int) ([]*Message, error) {
 }
 
 func (s *Store) Chats() ([]Chat, error) {
-	rows, err := s.db.Query(`SELECT jid, name, last_ts, last_text, unread FROM chats ORDER BY last_ts DESC`)
+	rows, err := s.db.Query(`SELECT jid, name, last_ts, last_text, unread, ephemeral FROM chats ORDER BY last_ts DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -306,7 +351,7 @@ func (s *Store) Chats() ([]Chat, error) {
 	for rows.Next() {
 		var c Chat
 		var ts int64
-		if err := rows.Scan(&c.JID, &c.Name, &ts, &c.LastText, &c.Unread); err != nil {
+		if err := rows.Scan(&c.JID, &c.Name, &ts, &c.LastText, &c.Unread, &c.Ephemeral); err != nil {
 			return nil, err
 		}
 		c.LastTime = time.UnixMilli(ts)
@@ -325,6 +370,42 @@ func (s *Store) SetChatName(jid, name string) error {
 	return err
 }
 
+// Chat returns one chat; a chat never stored comes back empty with its JID.
+func (s *Store) Chat(jid string) (Chat, error) {
+	c := Chat{JID: jid}
+	var ts int64
+	err := s.db.QueryRow(`SELECT name, last_ts, last_text, unread, ephemeral FROM chats WHERE jid = ?`, jid).
+		Scan(&c.Name, &ts, &c.LastText, &c.Unread, &c.Ephemeral)
+	if errors.Is(err, sql.ErrNoRows) {
+		return c, nil
+	}
+	c.LastTime = time.UnixMilli(ts)
+	return c, err
+}
+
+// SetEphemeral records a chat's disappearing-messages timer in seconds. A
+// zero never creates a chat row: empty conversations must not show up blank.
+func (s *Store) SetEphemeral(jid string, seconds uint32) error {
+	if seconds == 0 {
+		_, err := s.db.Exec(`UPDATE chats SET ephemeral = 0 WHERE jid = ?`, jid)
+		return err
+	}
+	_, err := s.db.Exec(`INSERT INTO chats (jid, ephemeral) VALUES (?,?)
+		ON CONFLICT (jid) DO UPDATE SET ephemeral = excluded.ephemeral`, jid, seconds)
+	return err
+}
+
+// OldestReal is the oldest message the phone also has, the anchor for asking
+// it for older ones: notice lines are this client's own.
+func (s *Store) OldestReal(chat string) (*Message, error) {
+	m, err := scan(s.db.QueryRow(`SELECT `+cols+` FROM messages WHERE chat = ? AND kind != ?
+		ORDER BY ts, rowid LIMIT 1`, chat, KindSystem))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return m, err
+}
+
 func (s *Store) SetUnread(jid string, n int) error {
 	_, err := s.db.Exec(`UPDATE chats SET unread = ? WHERE jid = ?`, n, jid)
 	return err
@@ -333,7 +414,7 @@ func (s *Store) SetUnread(jid string, n int) error {
 // Unread returns the newest limit incoming messages, for read receipts.
 func (s *Store) Unread(chat string, limit int) ([]*Message, error) {
 	rows, err := s.db.Query(`SELECT `+cols+` FROM messages WHERE chat = ? AND from_me = 0
-		ORDER BY ts DESC LIMIT ?`, chat, limit)
+		AND kind != ? ORDER BY ts DESC LIMIT ?`, chat, KindSystem, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +435,12 @@ func (s *Store) Unread(chat string, limit int) ([]*Message, error) {
 func (s *Store) SetStatus(chat, id string, status int) error {
 	_, err := s.db.Exec(`UPDATE messages SET status = ? WHERE chat = ? AND id = ? AND status < ?`,
 		status, chat, id, status)
+	return err
+}
+
+// ResetStatus puts a failed message back to pending for a retry.
+func (s *Store) ResetStatus(chat, id string) error {
+	_, err := s.db.Exec(`UPDATE messages SET status = ? WHERE chat = ? AND id = ?`, StatusPending, chat, id)
 	return err
 }
 

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -27,6 +28,8 @@ func dataDir() string {
 }
 
 func main() {
+	// gotk4 forwards GLib's log to slog; GTK's Vulkan loader chatter is INFO.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	dir := dataDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, err)

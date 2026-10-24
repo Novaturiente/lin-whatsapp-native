@@ -8,14 +8,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -30,14 +33,16 @@ import (
 type EventKind int
 
 const (
-	EvQR        EventKind = iota // QR holds the code to show
-	EvConnected                  // logged in and online
-	EvLoggedOut                  // the phone unlinked this device
-	EvMessage                    // a new message in Chat; Notify set if it should alert
-	EvUpdate                     // message ID in Chat changed: status, edit, delete, reaction, vote
-	EvChats                      // chat list changed in bulk: history sync, names
-	EvTyping                     // Typing tells whether Sender is composing in Chat
-	EvError                      // Text says what failed, for the user
+	EvQR         EventKind = iota // QR holds the code to show
+	EvConnected                   // logged in and online
+	EvLoggedOut                   // the phone unlinked this device
+	EvMessage                     // a new message in Chat; Notify set if it should alert
+	EvUpdate                      // message ID in Chat changed: status, edit, delete, reaction, vote
+	EvChats                       // chat list changed in bulk: history sync, names
+	EvTyping                      // Typing tells whether Sender is composing in Chat
+	EvError                       // Text says what failed, for the user
+	EvConnection                  // Text is "" when online, else what the banner should say
+	EvHistory                     // the phone sent older messages for Chat on request
 )
 
 type Event struct {
@@ -60,6 +65,7 @@ type Client struct {
 	names    map[string]string
 	asked    map[string]bool // groups whose name was requested
 	fetching map[string][]func(string, error)
+	outbox   map[string]*waE2E.Message // sends not yet accepted by the server, by ID
 }
 
 // Open loads the linked device from dir, or prepares a new one to pair.
@@ -77,8 +83,9 @@ func Open(ctx context.Context, dir string, st *store.Store) (*Client, error) {
 	c := &Client{
 		WA: whatsmeow.NewClient(device, waLog.Stdout("wa", "WARN", true)), Store: st,
 		Dir: filepath.Join(dir, "media"), names: map[string]string{}, asked: map[string]bool{},
-		fetching: map[string][]func(string, error){},
+		fetching: map[string][]func(string, error){}, outbox: map[string]*waE2E.Message{},
 	}
+	c.WA.InitialAutoReconnect = true // a network blip at launch must not leave the app offline
 	c.WA.AddEventHandler(c.handle)
 	return c, os.MkdirAll(c.Dir, 0o700)
 }
@@ -139,17 +146,29 @@ func (c *Client) handle(raw any) {
 	case *events.Connected:
 		_ = c.WA.SendPresence(ctx, types.PresenceUnavailable) // the window says when it is looked at
 		c.OnEvent(Event{Kind: EvConnected})
+		c.OnEvent(Event{Kind: EvConnection})
+	case *events.KeepAliveRestored:
+		c.OnEvent(Event{Kind: EvConnection})
+	case *events.Disconnected, *events.KeepAliveTimeout:
+		c.OnEvent(Event{Kind: EvConnection, Text: "Connecting…"})
+	case *events.StreamReplaced:
+		c.OnEvent(Event{Kind: EvConnection, Text: "WhatsApp was opened on another computer. Restart to use it here."})
+	case *events.ConnectFailure:
+		c.OnEvent(Event{Kind: EvConnection, Text: "Could not connect: " + e.Reason.String()})
+	case *events.TemporaryBan:
+		c.OnEvent(Event{Kind: EvConnection, Text: "WhatsApp has temporarily banned this account: " + e.String()})
 	case *events.LoggedOut:
+		c.OnEvent(Event{Kind: EvConnection, Text: "This device was unlinked. Restart the app to link it again."})
 		c.OnEvent(Event{Kind: EvLoggedOut})
+	case *events.CallOffer:
+		c.missedCall(ctx, e)
 	case *events.PushName, *events.Contact, *events.BusinessName:
 		c.forgetNames()
 	case *events.GroupInfo:
-		if e.Name != nil {
-			_ = c.Store.SetChatName(e.JID.String(), e.Name.Name)
-			c.forgetNames()
-		}
+		c.groupChange(ctx, e)
 	case *events.JoinedGroup:
 		_ = c.Store.SetChatName(e.JID.String(), e.GroupInfo.Name)
+		_ = c.Store.SetEphemeral(e.JID.String(), e.GroupInfo.DisappearingTimer)
 		c.forgetNames()
 	case *events.MarkChatAsRead:
 		if e.Action.GetRead() {
@@ -183,8 +202,17 @@ func (c *Client) message(ctx context.Context, e *events.Message, live bool) {
 		sender = c.Me().String()
 	}
 	u := Convert(e, chat, sender)
+	if live && u.Expiration > 0 { // a new message is proof of the chat's current timer; an old one is not
+		if ch, _ := c.Store.Chat(chat); ch.Ephemeral != u.Expiration {
+			_ = c.Store.SetEphemeral(chat, u.Expiration)
+		}
+	}
 	var target string
 	switch {
+	case u.Timer != nil:
+		_ = c.Store.SetEphemeral(chat, *u.Timer)
+		c.system(chat, e.Info.ID, e.Info.Timestamp, c.Name(sender)+" "+timerText(*u.Timer), live)
+		return
 	case u.Msg != nil:
 		u.Msg.RawChat, u.Msg.RawSender = e.Info.Chat.ToNonAD().String(), e.Info.Sender.ToNonAD().String()
 		if e.SourceWebMsg != nil && u.Msg.FromMe {
@@ -287,11 +315,21 @@ func (c *Client) history(ctx context.Context, e *events.HistorySync) {
 		}
 		chat := c.normalize(ctx, jid).String()
 		_ = c.Store.SetChatName(chat, conv.GetName())
+		// Only a full sync states the timer; on-demand batches leave it out.
+		if conv.EphemeralExpiration != nil && e.Data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
+			_ = c.Store.SetEphemeral(chat, conv.GetEphemeralExpiration())
+		}
 		// History arrives newest first; store oldest first so edits and
 		// deletes find the message they refer to.
 		msgs := conv.GetMessages()
 		for i := len(msgs) - 1; i >= 0; i-- {
 			wm := msgs[i].GetMessage()
+			if wm.GetMessageStubType() != 0 {
+				if text := c.stubText(ctx, wm); text != "" {
+					c.system(chat, wm.GetKey().GetID(), time.Unix(int64(wm.GetMessageTimestamp()), 0), text, false)
+				}
+				continue
+			}
 			evt, err := c.WA.ParseWebMessage(jid, wm)
 			if err != nil {
 				continue
@@ -309,8 +347,222 @@ func (c *Client) history(ctx context.Context, e *events.HistorySync) {
 		if n := conv.GetUnreadCount(); n > 0 {
 			_ = c.Store.SetUnread(chat, int(n))
 		}
+		if e.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
+			c.OnEvent(Event{Kind: EvHistory, Chat: chat})
+		}
 	}
 	c.OnEvent(Event{Kind: EvChats})
+}
+
+// RequestOlder asks the phone for up to 50 messages older than oldest. The
+// answer comes back as a history sync, then EvHistory.
+func (c *Client) RequestOlder(oldest *store.Message) {
+	info := &types.MessageInfo{ID: oldest.ID, Timestamp: oldest.Time,
+		MessageSource: types.MessageSource{Chat: chatOf(oldest), Sender: c.sender(oldest), IsFromMe: oldest.FromMe}}
+	go func() {
+		_, err := c.WA.SendMessage(context.Background(), c.Me(), c.WA.BuildHistorySyncRequest(info, 50),
+			whatsmeow.SendRequestExtra{Peer: true})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "history request:", err)
+		}
+	}()
+}
+
+// system stores a grey notice line in a chat; live ones show at once. It
+// reports whether the line is new, since notifications repeat on reconnect.
+func (c *Client) system(chat, id string, at time.Time, text string, live bool) bool {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	if old, _ := c.Store.Message(chat, id); old != nil {
+		return false
+	}
+	m := &store.Message{Chat: chat, ID: id, Sender: chat, Time: at, Kind: store.KindSystem,
+		Text: text, Status: store.StatusSent}
+	if err := c.Store.AddMessage(m, false); err != nil {
+		fmt.Fprintln(os.Stderr, "store:", err)
+		return false
+	}
+	if live {
+		c.OnEvent(Event{Kind: EvMessage, Chat: chat, ID: id})
+	}
+	return true
+}
+
+func timerText(seconds uint32) string {
+	if seconds == 0 {
+		return "turned off disappearing messages"
+	}
+	var d string
+	switch {
+	case seconds%86400 == 0:
+		d = fmt.Sprintf("%d days", seconds/86400)
+	case seconds%3600 == 0:
+		d = fmt.Sprintf("%d hours", seconds/3600)
+	default:
+		d = (time.Duration(seconds) * time.Second).String()
+	}
+	return "turned on disappearing messages: new messages disappear after " + strings.Replace(d, "1 days", "24 hours", 1)
+}
+
+// groupChange turns a group notification into notice lines, and keeps the
+// stored name and timer current.
+func (c *Client) groupChange(ctx context.Context, e *events.GroupInfo) {
+	chat := e.JID.String()
+	who := "Someone"
+	if e.SenderPN != nil {
+		who = c.Name(e.SenderPN.String())
+	} else if e.Sender != nil {
+		who = c.Name(c.normalize(ctx, *e.Sender).String())
+	}
+	names := func(list []types.JID) string {
+		var out []string
+		for _, j := range list {
+			out = append(out, c.Name(c.normalize(ctx, j).String()))
+		}
+		return strings.Join(out, ", ")
+	}
+	var lines []string
+	if e.Name != nil {
+		_ = c.Store.SetChatName(chat, e.Name.Name)
+		c.forgetNames()
+		lines = append(lines, fmt.Sprintf("%s changed the group name to \"%s\"", who, e.Name.Name))
+	}
+	if e.Topic != nil {
+		lines = append(lines, who+" changed the group description")
+	}
+	if e.Ephemeral != nil {
+		t := e.Ephemeral.DisappearingTimer
+		if !e.Ephemeral.IsEphemeral {
+			t = 0
+		}
+		_ = c.Store.SetEphemeral(chat, t)
+		lines = append(lines, who+" "+timerText(t))
+	}
+	if e.Announce != nil {
+		if e.Announce.IsAnnounce {
+			lines = append(lines, who+" changed settings so only admins can send messages")
+		} else {
+			lines = append(lines, who+" changed settings so all members can send messages")
+		}
+	}
+	if e.Locked != nil {
+		if e.Locked.IsLocked {
+			lines = append(lines, who+" changed settings so only admins can edit group info")
+		} else {
+			lines = append(lines, who+" changed settings so all members can edit group info")
+		}
+	}
+	if len(e.Join) > 0 {
+		if e.Sender != nil && len(e.Join) == 1 && c.normalize(ctx, e.Join[0]) == c.normalize(ctx, *e.Sender) {
+			lines = append(lines, names(e.Join)+" joined")
+		} else {
+			lines = append(lines, who+" added "+names(e.Join))
+		}
+	}
+	if len(e.Leave) > 0 {
+		if e.Sender != nil && len(e.Leave) == 1 && c.normalize(ctx, e.Leave[0]) == c.normalize(ctx, *e.Sender) {
+			lines = append(lines, names(e.Leave)+" left")
+		} else {
+			lines = append(lines, who+" removed "+names(e.Leave))
+		}
+	}
+	if len(e.Promote) > 0 {
+		lines = append(lines, names(e.Promote)+" is now an admin")
+	}
+	if len(e.Demote) > 0 {
+		lines = append(lines, names(e.Demote)+" is no longer an admin")
+	}
+	for i, text := range lines {
+		// timestamps are whole seconds; the text keeps two changes in one second apart
+		h := fnv.New32a()
+		h.Write([]byte(text))
+		c.system(chat, fmt.Sprintf("sys-%d-%d-%x", e.Timestamp.Unix(), i, h.Sum32()), e.Timestamp, text, true)
+	}
+}
+
+// stubText renders the notice lines history sync carries as stub types.
+func (c *Client) stubText(ctx context.Context, wm *waWeb.WebMessageInfo) string {
+	var people []string
+	for _, p := range wm.GetMessageStubParameters() {
+		if j, err := types.ParseJID(p); err == nil && j.User != "" && j.Server != "" {
+			people = append(people, c.Name(c.normalize(ctx, j).String()))
+		}
+	}
+	who := "Someone"
+	if p := wm.GetParticipant(); p != "" {
+		who = c.Name(c.keySender(ctx, false, p, ""))
+	} else if wm.GetKey().GetFromMe() {
+		who = "You"
+	} else if r := wm.GetKey().GetRemoteJID(); !strings.HasSuffix(r, "@g.us") {
+		who = c.Name(c.keySender(ctx, false, "", r)) // a direct chat: the other person
+	}
+	params := wm.GetMessageStubParameters()
+	first := ""
+	if len(params) > 0 {
+		first = params[0]
+	}
+	list := strings.Join(people, ", ")
+	switch wm.GetMessageStubType() {
+	case waWeb.WebMessageInfo_GROUP_CREATE:
+		return fmt.Sprintf("%s created group \"%s\"", who, first)
+	case waWeb.WebMessageInfo_GROUP_CHANGE_SUBJECT:
+		return fmt.Sprintf("%s changed the group name to \"%s\"", who, first)
+	case waWeb.WebMessageInfo_GROUP_CHANGE_DESCRIPTION:
+		return who + " changed the group description"
+	case waWeb.WebMessageInfo_GROUP_CHANGE_ICON:
+		return who + " changed this group's icon"
+	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_ADD, waWeb.WebMessageInfo_GROUP_PARTICIPANT_INVITE:
+		return who + " added " + list
+	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_REMOVE:
+		return who + " removed " + list
+	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_LEAVE:
+		return list + " left"
+	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_PROMOTE:
+		return list + " is now an admin"
+	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_DEMOTE:
+		return list + " is no longer an admin"
+	case waWeb.WebMessageInfo_CALL_MISSED_VOICE:
+		return "Missed voice call"
+	case waWeb.WebMessageInfo_CALL_MISSED_VIDEO:
+		return "Missed video call"
+	case waWeb.WebMessageInfo_CHANGE_EPHEMERAL_SETTING:
+		var secs uint32
+		fmt.Sscan(first, &secs)
+		return who + " " + timerText(secs)
+	}
+	return ""
+}
+
+// missedCall notes an incoming call. This client never answers calls; the
+// phone rings and may answer, so the line says only that a call came.
+// History later adds WhatsApp's own "Missed call" line when it was missed.
+func (c *Client) missedCall(ctx context.Context, e *events.CallOffer) {
+	kind := "voice"
+	if e.Data != nil {
+		if _, ok := e.Data.GetOptionalChildByTag("video"); ok {
+			kind = "video"
+		}
+	}
+	caller := e.CallCreator
+	if caller.Server == types.HiddenUserServer && !e.CallCreatorAlt.IsEmpty() {
+		caller = e.CallCreatorAlt // the phone number, when the LID is not mapped yet
+	}
+	if caller.IsEmpty() {
+		caller = e.From
+	}
+	from := c.normalize(ctx, caller).String()
+	chat := from
+	if !e.GroupJID.IsEmpty() {
+		chat = e.GroupJID.String()
+	}
+	text := fmt.Sprintf("📞 Incoming %s call from %s. Answer it on your phone.", kind, c.Name(from))
+	id := "call-" + e.CallID
+	if !c.system(chat, id, e.Timestamp, text, false) {
+		return // a repeat of an offer already shown
+	}
+	m, _ := c.Store.Message(chat, id)
+	c.OnEvent(Event{Kind: EvMessage, Chat: chat, ID: id, Notify: m})
 }
 
 // keySender is who a message key says sent something, normalised.
@@ -443,6 +695,52 @@ func (c *Client) Members(chat string) []string {
 		}
 	}
 	return out
+}
+
+type Contact struct{ JID, Name string }
+
+// Contacts lists people from the phone's address book plus anyone whose
+// push name we have seen, by name, for starting a chat.
+func (c *Client) Contacts() []Contact {
+	ctx := context.Background()
+	all, err := c.WA.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []Contact
+	for j := range all {
+		pn := c.normalize(ctx, j)
+		if pn.Server != types.DefaultUserServer || pn.User == c.Me().User || seen[pn.String()] {
+			continue
+		}
+		seen[pn.String()] = true
+		out = append(out, Contact{pn.String(), c.Name(pn.String())})
+	}
+	sort.Slice(out, func(a, b int) bool { return strings.ToLower(out[a].Name) < strings.ToLower(out[b].Name) })
+	return out
+}
+
+// Lookup checks a phone number (any format, with country code) is on
+// WhatsApp and returns its chat JID.
+func (c *Client) Lookup(phone string) (string, error) {
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phone)
+	if len(digits) < 8 {
+		return "", fmt.Errorf("enter the full number with country code")
+	}
+	res, err := c.WA.IsOnWhatsApp(context.Background(), []string{"+" + digits})
+	if err != nil {
+		return "", err
+	}
+	if len(res) == 0 || !res[0].IsIn {
+		return "", fmt.Errorf("+%s is not on WhatsApp", digits)
+	}
+	return res[0].JID.ToNonAD().String(), nil
 }
 
 // MarkRead sends read receipts for a chat's unread messages.

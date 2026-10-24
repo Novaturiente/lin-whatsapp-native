@@ -48,6 +48,9 @@ func (c *Client) quote(reply *store.Message, mentions []string) *waE2E.ContextIn
 // send stores msg as pending in chat, then delivers it. localMedia, when
 // set, is the file the message was made from, so it shows without a download.
 func (c *Client) send(chat string, msg *waE2E.Message, localMedia string) {
+	if ch, _ := c.Store.Chat(chat); ch.Ephemeral > 0 {
+		msg = withExpiration(msg, ch.Ephemeral)
+	}
 	id := c.WA.GenerateMessageID()
 	e := &events.Message{Message: msg, Info: types.MessageInfo{ID: id, Timestamp: time.Now(),
 		MessageSource: types.MessageSource{Chat: jid(chat), Sender: c.Me(), IsFromMe: true}}}
@@ -57,16 +60,95 @@ func (c *Client) send(chat string, msg *waE2E.Message, localMedia string) {
 		_ = c.Store.AddMessage(u.Msg, false)
 		c.OnEvent(Event{Kind: EvMessage, Chat: chat, ID: id})
 	}
+	c.transmit(chat, id, msg)
+}
+
+// transmit sends with a fixed ID. A failed message stays in outbox so Retry
+// sends the very same message again; the shared ID means the recipient never
+// sees it twice.
+func (c *Client) transmit(chat, id string, msg *waE2E.Message) {
+	c.mu.Lock()
+	c.outbox[id] = msg
+	c.mu.Unlock()
 	go func() {
 		_, err := c.WA.SendMessage(context.Background(), jid(chat), msg, whatsmeow.SendRequestExtra{ID: id})
 		status := store.StatusSent
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "send:", err)
 			status = store.StatusFailed
+		} else {
+			c.mu.Lock()
+			delete(c.outbox, id)
+			c.mu.Unlock()
 		}
 		_ = c.Store.SetStatus(chat, id, status)
 		c.OnEvent(Event{Kind: EvUpdate, Chat: chat, ID: id})
 	}()
+}
+
+// Retry sends a failed message again. After a restart the outbox is empty,
+// so it is rebuilt from what the store kept: the text, or the uploaded media.
+// shortcut: a rebuilt text loses its quote and mentions; persist the outbox
+// if retries after a restart turn out common.
+func (c *Client) Retry(m *store.Message) error {
+	c.mu.Lock()
+	msg := c.outbox[m.ID]
+	c.mu.Unlock()
+	if msg == nil {
+		msg = &waE2E.Message{}
+		if len(m.Raw) > 0 {
+			if err := proto.Unmarshal(m.Raw, msg); err != nil {
+				return err
+			}
+		} else if m.Kind == store.KindText {
+			msg.Conversation = proto.String(m.Text)
+		} else {
+			return fmt.Errorf("this message can no longer be resent")
+		}
+		if ch, _ := c.Store.Chat(m.Chat); ch.Ephemeral > 0 {
+			msg = withExpiration(msg, ch.Ephemeral)
+		}
+	}
+	if err := c.Store.ResetStatus(m.Chat, m.ID); err != nil {
+		return err
+	}
+	c.OnEvent(Event{Kind: EvUpdate, Chat: m.Chat, ID: m.ID})
+	c.transmit(m.Chat, m.ID, msg)
+	return nil
+}
+
+// withExpiration marks a message for a chat with disappearing messages on.
+// Without it the message stays forever on everyone else's phone.
+func withExpiration(msg *waE2E.Message, seconds uint32) *waE2E.Message {
+	if msg.Conversation != nil { // plain text has no ContextInfo to carry the timer
+		msg = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: msg.Conversation}}
+	}
+	var slot **waE2E.ContextInfo
+	switch {
+	case msg.ExtendedTextMessage != nil:
+		slot = &msg.ExtendedTextMessage.ContextInfo
+	case msg.ImageMessage != nil:
+		slot = &msg.ImageMessage.ContextInfo
+	case msg.VideoMessage != nil:
+		slot = &msg.VideoMessage.ContextInfo
+	case msg.AudioMessage != nil:
+		slot = &msg.AudioMessage.ContextInfo
+	case msg.DocumentMessage != nil:
+		slot = &msg.DocumentMessage.ContextInfo
+	case msg.StickerMessage != nil:
+		slot = &msg.StickerMessage.ContextInfo
+	case msg.PollCreationMessageV3 != nil:
+		slot = &msg.PollCreationMessageV3.ContextInfo
+	case msg.PollCreationMessage != nil:
+		slot = &msg.PollCreationMessage.ContextInfo
+	default:
+		return msg
+	}
+	if *slot == nil {
+		*slot = &waE2E.ContextInfo{}
+	}
+	(*slot).Expiration = proto.Uint32(seconds)
+	return msg
 }
 
 func (c *Client) SendText(chat, text string, reply *store.Message, mentions []string) {

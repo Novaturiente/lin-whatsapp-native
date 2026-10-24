@@ -28,12 +28,16 @@ const css = `
 .unread { background: @accent_bg_color; color: @accent_fg_color; border-radius: 10px;
 	padding: 0 6px; font-size: small; font-weight: bold; }
 .conversation { background: alpha(@window_fg_color, .03); }
+.system { font-size: small; padding: 3px 10px; margin: 4px 0; border-radius: 8px;
+	background: alpha(@window_fg_color, .07); opacity: .85; }
 `
 
 type Window struct {
 	win    *adw.ApplicationWindow
 	c      *wa.Client
 	split  *adw.NavigationSplitView
+	main   *gtk.Box // connection banner above the split view
+	banner *adw.Banner
 	toasts *adw.ToastOverlay
 	chats  *ChatList
 	conv   *Conversation
@@ -55,7 +59,13 @@ func New(app *adw.Application, c *wa.Client) *Window {
 	w.split = adw.NewNavigationSplitView()
 	w.split.SetSidebar(adw.NewNavigationPage(w.chats.root, "Chats"))
 	w.split.SetContent(adw.NewNavigationPage(w.conv.root, "Chat"))
-	w.toasts.SetChild(w.split)
+	w.split.SetVExpand(true)
+	w.banner = adw.NewBanner("Connecting…")
+	w.banner.SetRevealed(true) // until the first Connected
+	w.main = gtk.NewBox(gtk.OrientationVertical, 0)
+	w.main.Append(w.banner)
+	w.main.Append(w.split)
+	w.toasts.SetChild(w.main)
 
 	// Narrow window: show one pane at a time.
 	bp := adw.NewBreakpoint(adw.NewBreakpointConditionLength(adw.BreakpointConditionMaxWidth, 640, adw.LengthUnitSp))
@@ -87,6 +97,8 @@ func (w *Window) bindKeys() {
 			w.win.Close()
 		case ctrl && keyval == gdk.KEY_f:
 			w.chats.search.GrabFocus()
+		case ctrl && state&gdk.AltMask != 0 && (keyval == gdk.KEY_n || keyval == gdk.KEY_N):
+			w.newChat()
 		case keyval == gdk.KEY_Escape && w.conv.cancelCompose():
 		default:
 			return false
@@ -105,9 +117,16 @@ func (w *Window) dispatch(e wa.Event) {
 	case wa.EvConnected:
 		if w.qr != nil {
 			w.qr = nil
-			w.toasts.SetChild(w.split)
+			w.toasts.SetChild(w.main)
 		}
 		w.chats.reload()
+	case wa.EvConnection:
+		w.banner.SetTitle(e.Text)
+		w.banner.SetRevealed(e.Text != "")
+	case wa.EvHistory:
+		if e.Chat == w.conv.chat {
+			w.conv.historyArrived()
+		}
 	case wa.EvLoggedOut:
 		w.toast("This device was unlinked. Restart the app to link it again.")
 	case wa.EvMessage:

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,6 +14,61 @@ func open(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// An existing chat.db from before the migrations keeps its messages.
+func TestMigrateKeepsOldData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat.db")
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`INSERT INTO messages (chat, id, sender, from_me, ts, kind, text, file_name,
+		mime, voice, animated, view_once, options, multi_vote, quote_id, quote_sender, quote_text,
+		mentions, status) VALUES ('c','old','s',0,1,'text','kept','','',0,0,0,'[]',0,'','','','[]',1)`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if m, err := s.Message("c", "old"); err != nil || m == nil || m.Text != "kept" {
+		t.Fatalf("old message after migration: %+v %v", m, err)
+	}
+	if err := s.SetEphemeral("c", 86400); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := s.Chat("c"); c.Ephemeral != 86400 {
+		t.Fatalf("ephemeral = %d", c.Ephemeral)
+	}
+	s.Close()
+	if s, err = Open(path); err != nil { // reopening must not re-run migrations
+		t.Fatal(err)
+	}
+}
+
+func TestSystemLinesStayOutOfReceipts(t *testing.T) {
+	s := open(t)
+	c := "1@s.whatsapp.net"
+	s.AddMessage(&Message{Chat: c, ID: "sys-1", Sender: c, Time: time.Unix(1, 0), Kind: KindSystem, Text: "X left"}, false)
+	s.AddMessage(msg("real", 2, "hi"), true)
+	s.AddMessage(&Message{Chat: c, ID: "call-1", Sender: c, Time: time.Unix(3, 0), Kind: KindSystem, Text: "call"}, false)
+	if got, _ := s.Unread(c, 1); len(got) != 1 || got[0].ID != "real" {
+		t.Fatalf("unread: %+v", got)
+	}
+	if m, _ := s.OldestReal(c); m == nil || m.ID != "real" {
+		t.Fatalf("oldest real: %+v", m)
+	}
+	s.SetEphemeral("empty@s.whatsapp.net", 0)
+	if chats, _ := s.Chats(); len(chats) != 1 {
+		t.Fatalf("a zero timer created a chat: %+v", chats)
+	}
 }
 
 func msg(id string, sec int64, text string) *Message {

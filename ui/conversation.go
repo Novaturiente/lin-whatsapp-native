@@ -36,6 +36,11 @@ type Conversation struct {
 	slots    map[string]*gtk.Box // message ID to the row holding its bubble
 	oldest   *store.Message
 	loading  bool
+	storeEnd bool       // every stored message is shown; older ones are on the phone
+	asking   *gtk.Label // "Loading older messages…" while the phone is asked
+	askGen   int        // which request a timeout belongs to
+	phoneEnd bool       // the phone answered with nothing older
+	timer    *gtk.Label // ⏱ when disappearing messages are on
 	composer *Composer
 	typers   map[string]time.Time
 }
@@ -47,6 +52,9 @@ func newConversation(w *Window) *Conversation {
 	header := adw.NewHeaderBar()
 	c.avatar = adw.NewAvatar(32, "", true)
 	header.PackStart(c.avatar)
+	c.timer = gtk.NewLabel("⏱")
+	c.timer.SetVisible(false)
+	header.PackEnd(c.timer)
 	header.SetTitleWidget(c.title)
 	c.root.AddTopBar(header)
 
@@ -97,7 +105,9 @@ func (c *Conversation) open(chat string) {
 		return
 	}
 	c.composer.stopTyping() // tell the old chat, before c.chat moves on
-	c.chat, c.oldest, c.typers = chat, nil, map[string]time.Time{}
+	c.chat, c.oldest, c.typers, c.storeEnd, c.asking, c.loading = chat, nil, map[string]time.Time{}, false, nil, false
+	c.phoneEnd = false
+	c.askGen++
 	for child := c.box.FirstChild(); child != nil; child = c.box.FirstChild() {
 		c.box.Remove(child)
 	}
@@ -128,6 +138,12 @@ func (c *Conversation) refreshTitle() {
 		c.avatar.SetCustomImage(tex)
 	} else {
 		c.avatar.SetCustomImage(nil)
+	}
+	if ch, _ := c.w.c.Store.Chat(c.chat); ch.Ephemeral > 0 {
+		c.timer.SetTooltipText("Disappearing messages: " + (time.Duration(ch.Ephemeral) * time.Second).String())
+		c.timer.SetVisible(true)
+	} else {
+		c.timer.SetVisible(false)
 	}
 	c.showTyping()
 }
@@ -188,7 +204,8 @@ func (c *Conversation) loadOlder() {
 	}
 	page, _ := c.w.c.Store.Messages(c.chat, c.oldest, pageSize)
 	if len(page) == 0 {
-		c.oldest = nil
+		c.storeEnd = true
+		c.askPhone()
 		return
 	}
 	c.loading = true
@@ -202,6 +219,59 @@ func (c *Conversation) loadOlder() {
 		a.SetValue(a.Value() + a.Upper() - upper)
 		c.loading = false
 	})
+}
+
+// askPhone requests messages older than everything stored, as WhatsApp Web
+// does when you scroll past its cache. The answer arrives as EvHistory.
+func (c *Conversation) askPhone() {
+	if c.loading || c.phoneEnd {
+		return
+	}
+	anchor, _ := c.w.c.Store.OldestReal(c.chat)
+	if anchor == nil {
+		return // nothing the phone could page back from
+	}
+	c.note("Loading older messages from your phone…")
+	c.loading = true
+	c.askGen++
+	gen := c.askGen
+	c.w.c.RequestOlder(anchor)
+	glib.TimeoutSecondsAdd(20, func() bool { // the phone may never answer
+		if gen == c.askGen && c.loading {
+			c.note("Your phone sent no older messages. Scroll up to try again.")
+			c.loading = false
+		}
+		return false
+	})
+}
+
+// note shows one line above the oldest message, replacing the last one.
+func (c *Conversation) note(text string) {
+	if c.asking != nil {
+		c.box.Remove(c.asking)
+	}
+	c.asking = italic(text)
+	c.asking.SetHAlign(gtk.AlignCenter)
+	c.box.Prepend(c.asking)
+}
+
+func (c *Conversation) historyArrived() {
+	if !c.loading {
+		return
+	}
+	c.askGen++ // the timeout no longer applies
+	c.loading = false
+	if older, _ := c.w.c.Store.Messages(c.chat, c.oldest, 1); len(older) == 0 {
+		c.phoneEnd = true // asking again would bring the same nothing
+		c.note("No older messages on your phone.")
+		return
+	}
+	if c.asking != nil {
+		c.box.Remove(c.asking)
+		c.asking = nil
+	}
+	c.storeEnd = false
+	c.loadOlder()
 }
 
 // add shows a message that just arrived or was just sent.
@@ -247,6 +317,16 @@ func (c *Conversation) slot(m *store.Message) *gtk.Box {
 
 // bubble draws one message.
 func (c *Conversation) bubble(m *store.Message) gtk.Widgetter {
+	if m.Kind == store.KindSystem {
+		l := gtk.NewLabel(m.Text)
+		l.SetWrap(true)
+		l.SetJustify(gtk.JustifyCenter)
+		l.AddCSSClass("system")
+		l.SetHAlign(gtk.AlignCenter)
+		l.SetHExpand(true)
+		l.SetTooltipText(m.Time.Format("2 Jan 2006, 15:04"))
+		return l
+	}
 	col := gtk.NewBox(gtk.OrientationVertical, 3)
 	col.AddCSSClass("bubble")
 	if m.FromMe {
@@ -268,6 +348,12 @@ func (c *Conversation) bubble(m *store.Message) gtk.Widgetter {
 		name.SetXAlign(0)
 		name.AddCSSClass("sender")
 		col.Append(name)
+	}
+	if m.Forwarded && !m.Deleted {
+		f := gtk.NewLabel("↪ Forwarded")
+		f.SetXAlign(0)
+		f.AddCSSClass("meta")
+		col.Append(f)
 	}
 	if m.QuoteID != "" && !m.Deleted {
 		col.Append(c.quote(m))
@@ -358,9 +444,62 @@ func (c *Conversation) content(col *gtk.Box, m *store.Message) {
 		col.Append(italic("This message type is not supported here. Open it on your phone."))
 		return
 	}
+	if m.LinkTitle != "" {
+		col.Append(c.linkCard(m))
+	}
 	if m.Text != "" {
 		col.Append(c.textLabel(m))
 	}
+}
+
+// linkCard is the preview the sender's phone attached to a link.
+func (c *Conversation) linkCard(m *store.Message) gtk.Widgetter {
+	card := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	card.AddCSSClass("quote")
+	if len(m.Thumb) > 0 {
+		if tex, err := gdk.NewTextureFromBytes(glib.NewBytes(m.Thumb)); err == nil {
+			pic := gtk.NewPictureForPaintable(tex)
+			pic.SetSizeRequest(64, 64)
+			pic.SetContentFit(gtk.ContentFitCover)
+			card.Append(pic)
+		}
+	}
+	text := gtk.NewBox(gtk.OrientationVertical, 2)
+	title := gtk.NewLabel(m.LinkTitle)
+	title.SetXAlign(0)
+	title.SetWrap(true)
+	title.AddCSSClass("heading")
+	text.Append(title)
+	if m.LinkDesc != "" {
+		desc := gtk.NewLabel(m.LinkDesc)
+		desc.SetXAlign(0)
+		desc.SetWrap(true)
+		desc.SetLines(3)
+		desc.SetEllipsize(pango.EllipsizeEnd)
+		desc.AddCSSClass("dim-label")
+		text.Append(desc)
+	}
+	if m.LinkURL != "" {
+		u := gtk.NewLabel(m.LinkURL)
+		u.SetXAlign(0)
+		u.SetEllipsize(pango.EllipsizeEnd)
+		u.AddCSSClass("meta")
+		text.Append(u)
+	}
+	card.Append(text)
+	click := gtk.NewGestureClick()
+	click.ConnectReleased(func(int, float64, float64) {
+		if m.LinkURL == "" {
+			return
+		}
+		url := m.LinkURL
+		if !strings.Contains(url, "://") {
+			url = "https://" + url
+		}
+		gtk.NewURILauncher(url).Launch(context.Background(), &c.w.win.Window, nil)
+	})
+	card.AddController(click)
+	return card
 }
 
 func (c *Conversation) quote(m *store.Message) gtk.Widgetter {
@@ -392,7 +531,7 @@ func (c *Conversation) jumpTo(id string) {
 			})
 			return
 		}
-		if c.oldest == nil {
+		if c.oldest == nil || c.storeEnd {
 			return
 		}
 		c.loading = false

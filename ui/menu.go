@@ -51,6 +51,13 @@ func (c *Conversation) menu(anchor *gtk.Box, m *store.Message, x, y float64) {
 	row.Append(more)
 	col.Append(row)
 
+	if m.FromMe && m.Status == store.StatusFailed {
+		act("Retry sending", func() {
+			if err := c.w.c.Retry(m); err != nil {
+				c.w.toast(err.Error())
+			}
+		})
+	}
 	act("Reply", func() { c.composer.replyTo(m) })
 	if m.Text != "" && m.Kind != store.KindPoll {
 		act("Copy text", func() { anchor.Clipboard().SetText(m.Text) })

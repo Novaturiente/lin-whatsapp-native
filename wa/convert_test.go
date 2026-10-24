@@ -75,6 +75,38 @@ func TestConvertKinds(t *testing.T) {
 	}
 }
 
+func TestConvertPreviewForwardTimer(t *testing.T) {
+	u := Convert(evt(&waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+		Text: proto.String("look https://ex.com"), MatchedText: proto.String("https://ex.com"),
+		Title: proto.String("Ex"), Description: proto.String("An example"), JPEGThumbnail: []byte{9},
+		ContextInfo: &waE2E.ContextInfo{IsForwarded: proto.Bool(true), Expiration: proto.Uint32(604800)}}}), chat, sender)
+	m := u.Msg
+	if m == nil || m.LinkURL != "https://ex.com" || m.LinkTitle != "Ex" || m.LinkDesc != "An example" ||
+		len(m.Thumb) != 1 || !m.Forwarded || u.Expiration != 604800 {
+		t.Fatalf("preview/forward/expiration: %+v %+v", u, m)
+	}
+	u = Convert(evt(&waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_EPHEMERAL_SETTING.Enum(), EphemeralExpiration: proto.Uint32(86400)}}), chat, sender)
+	if u.Timer == nil || *u.Timer != 86400 {
+		t.Fatalf("timer: %+v", u)
+	}
+}
+
+func TestWithExpiration(t *testing.T) {
+	m := withExpiration(&waE2E.Message{Conversation: proto.String("hi")}, 86400)
+	if m.GetExtendedTextMessage().GetText() != "hi" || m.GetExtendedTextMessage().GetContextInfo().GetExpiration() != 86400 {
+		t.Fatalf("text: %v", m)
+	}
+	quoted := &waE2E.ContextInfo{StanzaID: proto.String("Q")}
+	m = withExpiration(&waE2E.Message{ImageMessage: &waE2E.ImageMessage{ContextInfo: quoted}}, 604800)
+	if ci := m.GetImageMessage().GetContextInfo(); ci.GetExpiration() != 604800 || ci.GetStanzaID() != "Q" {
+		t.Fatalf("image: %v", ci)
+	}
+	if u := Convert(evt(m), chat, sender); u.Expiration != 604800 {
+		t.Fatalf("round trip lost the timer")
+	}
+}
+
 func TestConvertControl(t *testing.T) {
 	key := &waCommon.MessageKey{ID: proto.String("T1")}
 	u := Convert(evt(&waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Key: key, Text: proto.String("👍")}}), chat, sender)

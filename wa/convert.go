@@ -20,6 +20,11 @@ type Update struct {
 	Edit     *Edit
 	Revoke   *Target
 	PollVote *Target // the vote itself is encrypted; Client decrypts it
+	Timer    *uint32 // the chat's disappearing-messages setting changed to this many seconds
+
+	// Expiration is the disappearing timer a message was sent with. Every
+	// message in such a chat carries it, so it also repairs a missed Timer.
+	Expiration uint32
 }
 
 type Target struct{ Chat, ID string }
@@ -49,6 +54,9 @@ func Convert(evt *events.Message, chat, sender string) Update {
 			return Update{Revoke: &Target{chat, p.GetKey().GetID()}}
 		case waE2E.ProtocolMessage_MESSAGE_EDIT:
 			return Update{Edit: &Edit{Target{chat, p.GetKey().GetID()}, Text(p.GetEditedMessage())}}
+		case waE2E.ProtocolMessage_EPHEMERAL_SETTING:
+			t := p.GetEphemeralExpiration()
+			return Update{Timer: &t}
 		}
 		return Update{}
 	}
@@ -67,6 +75,10 @@ func Convert(evt *events.Message, chat, sender string) Update {
 	switch {
 	case m.GetConversation() != "" || m.GetExtendedTextMessage() != nil:
 		out.Kind = store.KindText
+		if x := m.GetExtendedTextMessage(); x.GetTitle() != "" || x.GetMatchedText() != "" {
+			out.LinkURL, out.LinkTitle, out.LinkDesc = x.GetMatchedText(), x.GetTitle(), x.GetDescription()
+			out.Thumb = x.GetJPEGThumbnail()
+		}
 	case m.GetImageMessage() != nil:
 		x := m.GetImageMessage()
 		out.Kind, out.Mime, out.Thumb = store.KindImage, x.GetMimetype(), x.GetJPEGThumbnail()
@@ -123,7 +135,10 @@ func Convert(evt *events.Message, chat, sender string) Update {
 		out.Kind == store.KindDocument || out.Kind == store.KindSticker {
 		out.Raw, _ = proto.Marshal(m)
 	}
+	var expiration uint32
 	if ci := contextInfo(m); ci != nil {
+		expiration = ci.GetExpiration()
+		out.Forwarded = ci.GetIsForwarded()
 		out.Mentions = ci.GetMentionedJID()
 		if ci.GetStanzaID() != "" {
 			out.QuoteID, out.QuoteSender = ci.GetStanzaID(), ci.GetParticipant()
@@ -137,7 +152,7 @@ func Convert(evt *events.Message, chat, sender string) Update {
 	if evt.IsViewOnce {
 		out.Raw, out.Thumb = nil, nil // linked devices never get to open these
 	}
-	return Update{Msg: out}
+	return Update{Msg: out, Expiration: expiration}
 }
 
 func poll(m *waE2E.Message) *waE2E.PollCreationMessage {

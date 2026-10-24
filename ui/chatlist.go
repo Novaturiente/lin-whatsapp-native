@@ -19,21 +19,34 @@ type ChatList struct {
 	root   *adw.ToolbarView
 	search *gtk.SearchEntry
 	list   *gtk.ListBox
-	// by row index: gotk4 gives each signal a new Go wrapper, so row
-	// pointers never match a map key
-	jids    []string
-	names   []string
+	// Rows are found by their GTK widget name, which holds the chat JID:
+	// gotk4 hands each signal a new Go wrapper, so row pointers never match.
+	rows    map[string]*chatRow
 	pending bool
 	avatars map[string]*gdk.Texture // chat JID to picture; nil while unknown
 	asked   map[string]bool
 	sem     chan struct{} // profile picture downloads in flight
 }
 
+// chatRow is one chat's row and what it was last drawn from, so a refresh
+// redraws only the rows that changed.
+type chatRow struct {
+	row    *gtk.ListBoxRow
+	chat   store.Chat
+	name   string
+	avatar bool
+}
+
 func newChatList(w *Window) *ChatList {
 	l := &ChatList{w: w, root: adw.NewToolbarView(), search: gtk.NewSearchEntry(), list: gtk.NewListBox(),
-		avatars: map[string]*gdk.Texture{}, asked: map[string]bool{}, sem: make(chan struct{}, 3)}
+		rows: map[string]*chatRow{}, avatars: map[string]*gdk.Texture{}, asked: map[string]bool{},
+		sem: make(chan struct{}, 3)}
 	header := adw.NewHeaderBar()
 	header.SetTitleWidget(adw.NewWindowTitle("WhatsApp", ""))
+	newChat := gtk.NewButtonFromIconName("document-edit-symbolic")
+	newChat.SetTooltipText("New chat (Ctrl+Alt+N)")
+	newChat.ConnectClicked(w.newChat)
+	header.PackEnd(newChat)
 	l.root.AddTopBar(header)
 
 	l.search.SetPlaceholderText("Search chats")
@@ -43,11 +56,19 @@ func newChatList(w *Window) *ChatList {
 	l.search.ConnectSearchChanged(l.list.InvalidateFilter)
 	l.list.SetFilterFunc(func(row *gtk.ListBoxRow) bool {
 		q := strings.ToLower(l.search.Text())
-		return q == "" || strings.Contains(strings.ToLower(at(l.names, row)), q)
+		r := l.rows[row.Name()]
+		return q == "" || r != nil && strings.Contains(strings.ToLower(r.name), q)
+	})
+	l.list.SetSortFunc(func(a, b *gtk.ListBoxRow) int {
+		ra, rb := l.rows[a.Name()], l.rows[b.Name()]
+		if ra == nil || rb == nil {
+			return 0
+		}
+		return rb.chat.LastTime.Compare(ra.chat.LastTime) // newest first
 	})
 	l.list.AddCSSClass("navigation-sidebar")
 	l.list.ConnectRowActivated(func(row *gtk.ListBoxRow) {
-		if jid := at(l.jids, row); jid != "" {
+		if jid := row.Name(); l.rows[jid] != nil {
 			w.openChat(jid)
 		}
 	})
@@ -77,22 +98,45 @@ func (l *ChatList) reload() {
 	})
 }
 
+// rebuild brings the rows in line with the store, redrawing only rows whose
+// chat, name or picture changed.
 func (l *ChatList) rebuild() {
 	chats, err := l.w.c.Store.Chats()
 	if err != nil {
 		return
 	}
-	l.list.RemoveAll()
-	l.jids, l.names = nil, nil
+	seen := map[string]bool{}
+	changed := false
 	for _, c := range chats {
+		seen[c.JID] = true
 		name := l.w.c.Name(c.JID)
-		row := gtk.NewListBoxRow()
-		row.SetChild(l.rowContent(c, name))
-		l.jids, l.names = append(l.jids, c.JID), append(l.names, name)
-		l.list.Append(row)
-		if c.JID == l.w.conv.chat {
-			l.list.SelectRow(row)
+		hasAvatar := l.avatar(c.JID) != nil
+		r := l.rows[c.JID]
+		if r == nil {
+			r = &chatRow{row: gtk.NewListBoxRow()}
+			r.row.SetName(c.JID)
+			l.rows[c.JID] = r
+			l.list.Append(r.row)
+		} else if r.chat == c && r.name == name && r.avatar == hasAvatar {
+			continue
 		}
+		r.chat, r.name, r.avatar = c, name, hasAvatar
+		r.row.SetChild(l.rowContent(c, name))
+		changed = true
+	}
+	for jid, r := range l.rows {
+		if !seen[jid] {
+			l.list.Remove(r.row)
+			delete(l.rows, jid)
+			changed = true
+		}
+	}
+	if changed {
+		l.list.InvalidateSort()
+		l.list.InvalidateFilter()
+	}
+	if r := l.rows[l.w.conv.chat]; r != nil {
+		l.list.SelectRow(r.row)
 	}
 }
 
