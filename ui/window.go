@@ -171,6 +171,14 @@ func (w *Window) dispatch(e wa.Event) {
 		if e.Notify != nil && (!w.win.IsActive() || e.Chat != w.conv.chat) {
 			w.notify(e)
 		}
+	case wa.EvMissed:
+		if !w.win.IsActive() {
+			title := "WhatsApp"
+			if e.Chat != "" {
+				title = w.c.Name(e.Chat)
+			}
+			w.popup(e.Chat, title, e.Text)
+		}
 	case wa.EvUpdate:
 		if e.Chat == w.conv.chat {
 			w.conv.update(e.ID)
@@ -226,18 +234,27 @@ func (w *Window) notify(e wa.Event) {
 	if strings.HasSuffix(e.Chat, "@g.us") {
 		body = w.c.Name(m.Sender) + ": " + body
 	}
+	w.popup(e.Chat, title, body)
+}
+
+// popup runs notify-send; clicking opens chat, or just raises the window when chat is "".
+func (w *Window) popup(chat, title, body string) {
 	go func() {
-		args := []string{"-a", "WhatsApp", "-i", "lin-whatsapp-native", "-A", "default=Open"}
+		args := []string{"-a", "WhatsApp", "-i", "io.github.nova.LinWhatsappNative", "-A", "default=Open"}
 		// The picture goes in the image-path hint: shells such as quickshell
 		// show it large, while -i is only the small app icon.
-		if pic := w.c.Avatar(e.Chat); pic != "" {
-			args = append(args, "-h", "string:image-path:file://"+pic)
+		if chat != "" {
+			if pic := w.c.Avatar(chat); pic != "" {
+				args = append(args, "-h", "string:image-path:file://"+pic)
+			}
 		}
 		out, err := exec.CommandContext(context.Background(), "notify-send",
 			append(args, title, body)...).Output()
 		if err == nil && strings.TrimSpace(string(out)) == "default" {
 			glib.IdleAdd(func() {
-				w.openChat(e.Chat)
+				if chat != "" {
+					w.openChat(chat)
+				}
 				w.win.Present()
 			})
 		}

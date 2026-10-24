@@ -43,6 +43,7 @@ const (
 	EvError                       // Text says what failed, for the user
 	EvConnection                  // Text is "" when online, else what the banner should say
 	EvHistory                     // the phone sent older messages for Chat on request
+	EvMissed                      // catch-up after being offline brought Text; Chat set if all in one chat
 )
 
 type Event struct {
@@ -66,6 +67,11 @@ type Client struct {
 	asked    map[string]bool // groups whose name was requested
 	fetching map[string][]func(string, error)
 	outbox   map[string]*waE2E.Message // sends not yet accepted by the server, by ID
+
+	// While the server replays what arrived during downtime, messages are
+	// counted per chat instead of each raising a notification.
+	catchingUp bool
+	missed     map[string]int
 }
 
 // Open loads the linked device from dir, or prepares a new one to pair.
@@ -84,6 +90,7 @@ func Open(ctx context.Context, dir string, st *store.Store) (*Client, error) {
 		WA: whatsmeow.NewClient(device, waLog.Stdout("wa", "WARN", true)), Store: st,
 		Dir: filepath.Join(dir, "media"), names: map[string]string{}, asked: map[string]bool{},
 		fetching: map[string][]func(string, error){}, outbox: map[string]*waE2E.Message{},
+		missed: map[string]int{},
 	}
 	c.WA.InitialAutoReconnect = true // a network blip at launch must not leave the app offline
 	c.WA.AddEventHandler(c.handle)
@@ -149,7 +156,20 @@ func (c *Client) handle(raw any) {
 		c.OnEvent(Event{Kind: EvConnection})
 	case *events.KeepAliveRestored:
 		c.OnEvent(Event{Kind: EvConnection})
-	case *events.Disconnected, *events.KeepAliveTimeout:
+	case *events.OfflineSyncPreview:
+		if e.Messages > 0 {
+			c.mu.Lock()
+			c.catchingUp = true
+			c.mu.Unlock()
+		}
+	case *events.OfflineSyncCompleted:
+		c.caughtUp()
+	case *events.Disconnected:
+		c.mu.Lock()
+		c.catchingUp = false // a cut-off catch-up must not mute live messages; counts carry to the next one
+		c.mu.Unlock()
+		c.OnEvent(Event{Kind: EvConnection, Text: "Connecting…"})
+	case *events.KeepAliveTimeout:
 		c.OnEvent(Event{Kind: EvConnection, Text: "Connecting…"})
 	case *events.StreamReplaced:
 		c.OnEvent(Event{Kind: EvConnection, Text: "WhatsApp was opened on another computer. Restart to use it here."})
@@ -174,6 +194,35 @@ func (c *Client) handle(raw any) {
 			c.OnEvent(Event{Kind: EvChats})
 		}
 	}
+}
+
+// caughtUp ends a catch-up with one summary instead of a notification per message.
+func (c *Client) caughtUp() {
+	c.mu.Lock()
+	missed := c.missed
+	c.catchingUp, c.missed = false, map[string]int{}
+	c.mu.Unlock()
+	n, only := 0, ""
+	for chat, k := range missed {
+		n, only = n+k, chat
+	}
+	if n == 0 {
+		return
+	}
+	ev := Event{Kind: EvMissed, Text: plural(n, "new message")}
+	if len(missed) == 1 {
+		ev.Chat = only
+	} else {
+		ev.Text += " in " + plural(len(missed), "chat")
+	}
+	c.OnEvent(ev)
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
 }
 
 func (c *Client) forgetNames() {
@@ -222,7 +271,13 @@ func (c *Client) message(ctx context.Context, e *events.Message, live bool) {
 		if live {
 			ev := Event{Kind: EvMessage, Chat: chat, ID: u.Msg.ID}
 			if !u.Msg.FromMe {
-				ev.Notify = u.Msg
+				c.mu.Lock()
+				if c.catchingUp {
+					c.missed[chat]++
+				} else {
+					ev.Notify = u.Msg
+				}
+				c.mu.Unlock()
 			}
 			c.OnEvent(ev)
 		}
