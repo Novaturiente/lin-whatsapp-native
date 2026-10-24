@@ -18,8 +18,10 @@ import (
 	"strings"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
+	"google.golang.org/protobuf/proto"
 )
 
 // Ext picks a file extension: the original name's if there is one, else
@@ -129,6 +131,22 @@ func VideoThumbnail(path string) []byte {
 		return nil
 	}
 	return out
+}
+
+// Size is the byte size a stored media message declares, 0 when unknown.
+func Size(raw []byte) uint64 {
+	var m waE2E.Message
+	if len(raw) == 0 || proto.Unmarshal(raw, &m) != nil {
+		return 0
+	}
+	for _, n := range []uint64{m.GetVideoMessage().GetFileLength(), m.GetImageMessage().GetFileLength(),
+		m.GetAudioMessage().GetFileLength(), m.GetDocumentMessage().GetFileLength(),
+		m.GetPtvMessage().GetFileLength(), m.GetStickerMessage().GetFileLength()} {
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // Seconds is a media file's duration, through ffprobe; 0 when unknown.

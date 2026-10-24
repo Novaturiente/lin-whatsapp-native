@@ -34,6 +34,9 @@ func TestMigrateKeepsOldData(t *testing.T) {
 	if _, err := old.Exec(`INSERT INTO messages (chat, id, sender, from_me, ts, kind, text, file_name,
 		mime, voice, animated, view_once, options, multi_vote, quote_id, quote_sender, quote_text,
 		mentions, status) VALUES ('c','call-1','c',0,2,'system','📞 Incoming voice call from X','','',0,0,0,'[]',0,'','','','[]',1);
+		INSERT INTO messages (chat, id, sender, from_me, ts, kind, text, file_name,
+		mime, voice, animated, view_once, options, multi_vote, quote_id, quote_sender, quote_text,
+		mentions, status) VALUES ('c','edit-1','c',0,1,'other','','','',0,0,0,'[]',0,'','','','[]',1);
 		INSERT INTO chats (jid, last_ts, last_text) VALUES ('c', 2, '📞 Incoming voice call from X')`); err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +52,9 @@ func TestMigrateKeepsOldData(t *testing.T) {
 	}
 	if m, _ := s.Message("c", "call-1"); m != nil {
 		t.Fatalf("call notice survived migration 2")
+	}
+	if m, _ := s.Message("c", "edit-1"); m != nil {
+		t.Fatalf("unsupported row survived migration 3")
 	}
 	if ch, _ := s.Chat("c"); ch.LastText != "kept" {
 		t.Fatalf("chat preview still %q", ch.LastText)

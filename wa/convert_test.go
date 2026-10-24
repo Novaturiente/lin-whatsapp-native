@@ -124,6 +124,15 @@ func TestConvertControl(t *testing.T) {
 	if u.Edit == nil || u.Edit.ID != "T1" || u.Edit.Text != "fixed" {
 		t.Errorf("edit: %+v", u)
 	}
+	u = Convert(evt(&waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{TargetMessageKey: key,
+		SecretEncType: waE2E.SecretEncryptedMessage_MESSAGE_EDIT.Enum()}}), chat, sender)
+	if u.Sealed == nil || u.Sealed.ID != "T1" || u.Msg != nil {
+		t.Errorf("sealed edit shown as a message: %+v", u)
+	}
+	u = Convert(evt(&waE2E.Message{EventMessage: &waE2E.EventMessage{}}), chat, sender)
+	if u.Msg == nil || u.Msg.FileName != "eventMessage" {
+		t.Errorf("unknown type not named: %+v", u.Msg)
+	}
 	u = Convert(evt(&waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{PollCreationMessageKey: key}}), chat, sender)
 	if u.PollVote == nil || u.PollVote.ID != "T1" {
 		t.Errorf("poll vote: %+v", u)

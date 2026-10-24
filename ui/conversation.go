@@ -25,22 +25,23 @@ import (
 const pageSize = 60
 
 type Conversation struct {
-	w        *Window
-	root     *adw.ToolbarView
-	title    *adw.WindowTitle
-	avatar   *adw.Avatar
-	stack    *gtk.Stack
-	scroll   *gtk.ScrolledWindow
-	box      *gtk.Box
-	chat     string
-	slots    map[string]*gtk.Box // message ID to the row holding its bubble
-	oldest   *store.Message
-	loading  bool
-	storeEnd bool       // every stored message is shown; older ones are on the phone
-	asking   *gtk.Label // "Loading older messages…" while the phone is asked
-	askGen   int        // which request a timeout belongs to
-	cursor   *gtk.Box   // the message the keyboard acts on
-	menuOpen bool       // a message menu is up; the pane's letter keys stand down
+	w          *Window
+	root       *adw.ToolbarView
+	title      *adw.WindowTitle
+	avatar     *adw.Avatar
+	stack      *gtk.Stack
+	scroll     *gtk.ScrolledWindow
+	box        *gtk.Box
+	chat       string
+	slots      map[string]*gtk.Box // message ID to the row holding its bubble
+	oldest     *store.Message
+	loading    bool
+	storeEnd   bool       // every stored message is shown; older ones are on the phone
+	asking     *gtk.Label // "Loading older messages…" while the phone is asked
+	askGen     int        // which request a timeout belongs to
+	cursor     *gtk.Box   // the message the keyboard acts on
+	lastSender string     // sender of the newest bubble shown, for avatar runs
+	menuOpen   bool       // a message menu is up; the pane's letter keys stand down
 
 	searchBar   *gtk.SearchBar
 	searchEntry *gtk.SearchEntry
@@ -62,6 +63,10 @@ func newConversation(w *Window) *Conversation {
 	header.SetTitleWidget(c.title)
 	c.root.AddTopBar(header)
 	c.root.AddTopBar(c.buildSearch())
+	find := gtk.NewButtonFromIconName("system-search-symbolic")
+	find.SetTooltipText("Search messages (Ctrl+F or /)")
+	find.ConnectClicked(c.openSearch)
+	header.PackEnd(find)
 
 	c.box.SetMarginStart(12)
 	c.box.SetMarginEnd(12)
@@ -130,8 +135,11 @@ func (c *Conversation) open(chat string) {
 	c.composer.reset()
 	c.refreshTitle()
 	page, _ := c.w.c.Store.Messages(chat, nil, pageSize)
+	c.w.chats.waiters = map[string][]*adw.Avatar{} // the old chat's bubbles are gone
+	c.lastSender = ""
 	for _, m := range page {
-		c.box.Append(c.slot(m))
+		c.box.Append(c.slot(m, m.Sender != c.lastSender))
+		c.lastSender = sender(m)
 	}
 	if len(page) > 0 {
 		c.oldest = page[0]
@@ -229,7 +237,7 @@ func (c *Conversation) loadOlderPage() bool {
 	a := c.scroll.VAdjustment()
 	upper := a.Upper()
 	for i := len(page) - 1; i >= 0; i-- {
-		c.box.Prepend(c.slot(page[i]))
+		c.box.Prepend(c.slot(page[i], i == 0 || sender(page[i-1]) != page[i].Sender))
 	}
 	c.oldest = page[0]
 	glib.IdleAdd(func() { // keep the message under the reader where it was
@@ -303,7 +311,8 @@ func (c *Conversation) add(id string) {
 		return
 	}
 	end := c.nearEnd()
-	c.box.Append(c.slot(m))
+	c.box.Append(c.slot(m, m.Sender != c.lastSender))
+	c.lastSender = sender(m)
 	delete(c.typers, m.Sender)
 	c.showTyping()
 	if end || m.FromMe {
@@ -320,16 +329,39 @@ func (c *Conversation) update(id string) {
 	if err != nil || m == nil {
 		return
 	}
-	if old := slot.FirstChild(); old != nil {
+	if old := slot.LastChild(); old != nil { // the bubble; an avatar column stays
 		slot.Remove(old)
 	}
 	slot.Append(c.bubble(m))
 }
 
-func (c *Conversation) slot(m *store.Message) *gtk.Box {
-	slot := gtk.NewBox(gtk.OrientationHorizontal, 0)
+// sender is who a run of bubbles belongs to; notice lines break runs.
+func sender(m *store.Message) string {
+	if m.Kind == store.KindSystem {
+		return ""
+	}
+	return m.Sender
+}
+
+// slot holds one message. In groups, others' messages get the sender's
+// picture beside the first bubble of each run, as WhatsApp does.
+func (c *Conversation) slot(m *store.Message, runStart bool) *gtk.Box {
+	slot := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	slot.AddCSSClass("slot")
 	slot.SetName(m.ID) // gotk4 wrappers differ per call; the name is the key
+	if isGroup(m.Chat) && !m.FromMe && m.Kind != store.KindSystem {
+		if runStart {
+			av := adw.NewAvatar(30, c.w.c.Name(m.Sender), true)
+			av.SetVAlign(gtk.AlignStart)
+			av.SetMarginTop(2)
+			c.w.chats.attach(m.Sender, av)
+			slot.Append(av)
+		} else {
+			gap := gtk.NewBox(gtk.OrientationHorizontal, 0)
+			gap.SetSizeRequest(30, -1)
+			slot.Append(gap)
+		}
+	}
 	slot.Append(c.bubble(m))
 	c.slots[m.ID] = slot
 	return slot
@@ -381,9 +413,15 @@ func (c *Conversation) bubble(m *store.Message) gtk.Widgetter {
 	c.content(col, m)
 	col.Append(c.meta(m))
 
+	// A bubble never spans the pane: long text wraps at about WhatsApp's width.
+	clamp := adw.NewClamp()
+	clamp.SetMaximumSize(560)
+	clamp.SetTighteningThreshold(560)
+	clamp.SetChild(col)
+	clamp.SetHAlign(col.HAlign())
 	outer := gtk.NewBox(gtk.OrientationVertical, 0)
 	outer.SetHExpand(true)
-	outer.Append(col)
+	outer.Append(clamp)
 	if r := c.reactions(m); r != nil {
 		if m.FromMe {
 			r.SetHAlign(gtk.AlignEnd)
@@ -708,9 +746,30 @@ func (c *Conversation) video(m *store.Message) gtk.Widgetter {
 	pic := gtk.NewPicture()
 	pic.SetContentFit(gtk.ContentFitContain)
 	pic.SetSizeRequest(320, 180)
-	if tex, err := gdk.NewTextureFromBytes(glib.NewBytes(m.Thumb)); err == nil && len(m.Thumb) > 0 {
-		pic.SetPaintable(tex)
-		pic.SetSizeRequest(fitted(tex.Width(), tex.Height(), 320))
+	show := func(jpg []byte) {
+		if tex, err := gdk.NewTextureFromBytes(glib.NewBytes(jpg)); err == nil {
+			pic.SetPaintable(tex)
+			pic.SetSizeRequest(fitted(tex.Width(), tex.Height(), 320))
+		}
+	}
+	if len(m.Thumb) > 0 {
+		show(m.Thumb)
+	} else if size := media.Size(m.Raw); size > 0 && size <= 25<<20 && !m.Animated {
+		// Sent without a preview (WhatsApp Web and desktop do this): make one
+		// from the first frame, once, and keep it.
+		c.w.c.Fetch(m, func(path string, err error) {
+			if err != nil {
+				return
+			}
+			go func() {
+				jpg := media.VideoThumbnail(path)
+				if len(jpg) == 0 {
+					return
+				}
+				_ = c.w.c.Store.SetThumb(m.Chat, m.ID, jpg)
+				glib.IdleAdd(func() { show(jpg) })
+			}()
+		})
 	}
 	frame.SetChild(pic)
 	play := gtk.NewButtonFromIconName("media-playback-start-symbolic")

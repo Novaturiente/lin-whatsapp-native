@@ -22,8 +22,12 @@ const shortcutsHelp = `Panes
   F6, Shift+F6            next / previous pane
   Alt+↑ / Alt+↓           previous / next chat
   Ctrl+K                  search chats (↓ then Enter opens)
+
+Chat list
+  ↑ ↓ or k j, g G         move          Enter, o or l   open
+  /                       search chats
   Ctrl+Alt+N              new chat
-  Ctrl+F                  search in this chat (Enter older, Shift+Enter newer)
+  Ctrl+F or / (messages)  search in this chat (Enter older, Shift+Enter newer)
 
 Messages pane
   ↑ ↓ or k j              move between messages
@@ -276,6 +280,8 @@ func (c *Conversation) messagesKey(keyval uint, state gdk.ModifierType) bool {
 		c.moveCursor(c.lastSlot())
 	case gdk.KEY_i, gdk.KEY_Escape:
 		c.composer.focus()
+	case gdk.KEY_slash:
+		c.openSearch()
 	default:
 		return c.actOnCursor(keyval)
 	}

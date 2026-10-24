@@ -61,7 +61,7 @@ window.main headerbar { border-bottom: 1px solid alpha(@window_fg_color, .08); }
 func opacity() float64 {
 	v, err := strconv.ParseFloat(os.Getenv("LINWA_OPACITY"), 64)
 	if err != nil {
-		return 0.85
+		return 0.5 // half see-through; the compositor's blur does the rest
 	}
 	return min(max(v, 0.3), 1)
 }

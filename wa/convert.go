@@ -7,6 +7,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"lin-whatsapp-native/store"
 )
@@ -20,7 +21,10 @@ type Update struct {
 	Edit     *Edit
 	Revoke   *Target
 	PollVote *Target // the vote itself is encrypted; Client decrypts it
-	Timer    *uint32 // the chat's disappearing-messages setting changed to this many seconds
+	// Sealed is an edit (or reaction) encrypted with the target message's
+	// secret, as current WhatsApp sends them; Client decrypts it.
+	Sealed *Target
+	Timer  *uint32 // the chat's disappearing-messages setting changed to this many seconds
 
 	// Expiration is the disappearing timer a message was sent with. Every
 	// message in such a chat carries it, so it also repairs a missed Timer.
@@ -59,6 +63,12 @@ func Convert(evt *events.Message, chat, sender string) Update {
 			return Update{Timer: &t}
 		}
 		return Update{}
+	}
+	if s := m.GetSecretEncryptedMessage(); s != nil {
+		return Update{Sealed: &Target{chat, s.GetTargetMessageKey().GetID()}}
+	}
+	if r := m.GetEncReactionMessage(); r != nil {
+		return Update{Sealed: &Target{chat, r.GetTargetMessageKey().GetID()}}
 	}
 	if m.GetPollUpdateMessage() != nil {
 		return Update{PollVote: &Target{chat, m.GetPollUpdateMessage().GetPollCreationMessageKey().GetID()}}
@@ -130,6 +140,7 @@ func Convert(evt *events.Message, chat, sender string) Update {
 			return Update{}
 		}
 		out.Kind = store.KindOther
+		out.FileName = typeName(m) // says which type, so a gap can be named and filled
 	}
 	if out.Kind == store.KindImage || out.Kind == store.KindVideo || out.Kind == store.KindAudio ||
 		out.Kind == store.KindDocument || out.Kind == store.KindSticker {
@@ -153,6 +164,19 @@ func Convert(evt *events.Message, chat, sender string) Update {
 		out.Raw, out.Thumb = nil, nil // linked devices never get to open these
 	}
 	return Update{Msg: out, Expiration: expiration}
+}
+
+// typeName is the first field set on a message, e.g. "eventMessage".
+func typeName(m *waE2E.Message) string {
+	name := ""
+	m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if fd.JSONName() != "messageContextInfo" && fd.JSONName() != "senderKeyDistributionMessage" {
+			name = fd.JSONName()
+			return false
+		}
+		return true
+	})
+	return name
 }
 
 func poll(m *waE2E.Message) *waE2E.PollCreationMessage {

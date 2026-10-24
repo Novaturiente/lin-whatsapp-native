@@ -245,12 +245,42 @@ func (c *Client) message(ctx context.Context, e *events.Message, live bool) {
 			fmt.Fprintln(os.Stderr, "poll vote:", err)
 			return
 		}
+	case u.Sealed != nil:
+		target = u.Sealed.ID
+		if !c.unseal(ctx, e, chat, sender, target) {
+			return
+		}
 	default:
 		return
 	}
 	if live {
 		c.OnEvent(Event{Kind: EvUpdate, Chat: chat, ID: target})
 	}
+}
+
+// unseal decrypts an edit or reaction sealed with the target's secret and
+// applies it. It reports whether anything changed.
+func (c *Client) unseal(ctx context.Context, e *events.Message, chat, sender, target string) bool {
+	if e.Message.GetEncReactionMessage() != nil {
+		r, err := c.WA.DecryptReaction(ctx, e)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "reaction:", err)
+			return false
+		}
+		return c.Store.React(chat, target, sender, r.GetText()) == nil
+	}
+	inner, err := c.WA.DecryptSecretEncryptedMessage(ctx, e)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sealed message:", err)
+		return false
+	}
+	if p := inner.GetProtocolMessage(); p != nil && p.GetEditedMessage() != nil {
+		inner = p.GetEditedMessage()
+	}
+	if !c.ownedBy(chat, target, sender) {
+		return false
+	}
+	return c.Store.Edit(chat, target, Text(inner)) == nil
 }
 
 // ownedBy reports whether sender wrote the message, so only its author can

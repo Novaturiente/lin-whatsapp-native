@@ -135,8 +135,14 @@ var migrations = []string{
 	`DELETE FROM messages WHERE kind = 'system' AND (id LIKE 'call-%'
 		OR text LIKE '%disappearing messages%' OR text LIKE 'Missed %call');
 	UPDATE chats SET last_text = COALESCE((SELECT text FROM messages m WHERE m.chat = chats.jid
-		AND m.deleted = 0 ORDER BY ts DESC, rowid DESC LIMIT 1), '')
+		AND m.deleted = 0 AND m.kind != 'other' ORDER BY ts DESC, rowid DESC LIMIT 1), '')
 	WHERE last_text LIKE '%call%' OR last_text LIKE '%disappearing messages%';`,
+	// Edits sent sealed (secretEncryptedMessage) were stored as unsupported
+	// rows before the client could open them; they hold nothing to show.
+	`DELETE FROM messages WHERE kind = 'other';
+	UPDATE chats SET last_text = COALESCE((SELECT text FROM messages m WHERE m.chat = chats.jid
+		AND m.deleted = 0 ORDER BY ts DESC, rowid DESC LIMIT 1), '')
+	WHERE last_text IN ('Unsupported message', '');`,
 }
 
 func migrate(db *sql.DB) error {
@@ -470,6 +476,12 @@ func (s *Store) SetStatus(chat, id string, status int) error {
 // ResetStatus puts a failed message back to pending for a retry.
 func (s *Store) ResetStatus(chat, id string) error {
 	_, err := s.db.Exec(`UPDATE messages SET status = ? WHERE chat = ? AND id = ?`, StatusPending, chat, id)
+	return err
+}
+
+// SetThumb stores a preview made here, for media sent without one.
+func (s *Store) SetThumb(chat, id string, jpg []byte) error {
+	_, err := s.db.Exec(`UPDATE messages SET thumb = ? WHERE chat = ? AND id = ?`, jpg, chat, id)
 	return err
 }
 

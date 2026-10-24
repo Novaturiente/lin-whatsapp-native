@@ -25,7 +25,8 @@ type ChatList struct {
 	pending bool
 	avatars map[string]*gdk.Texture // chat JID to picture; nil while unknown
 	asked   map[string]bool
-	sem     chan struct{} // profile picture downloads in flight
+	sem     chan struct{}            // profile picture downloads in flight
+	waiters map[string][]*adw.Avatar // avatars elsewhere waiting for a picture
 }
 
 // chatRow is one chat's row and what it was last drawn from, so a refresh
@@ -40,7 +41,8 @@ type chatRow struct {
 func newChatList(w *Window) *ChatList {
 	l := &ChatList{w: w, root: adw.NewToolbarView(), search: gtk.NewSearchEntry(), list: gtk.NewListBox(),
 		rows: map[string]*chatRow{}, avatars: map[string]*gdk.Texture{}, asked: map[string]bool{},
-		sem: make(chan struct{}, 3)}
+		waiters: map[string][]*adw.Avatar{},
+		sem:     make(chan struct{}, 3)}
 	header := adw.NewHeaderBar()
 	header.SetTitleWidget(adw.NewWindowTitle("WhatsApp", ""))
 	newChat := gtk.NewButtonFromIconName("document-edit-symbolic")
@@ -74,6 +76,33 @@ func newChatList(w *Window) *ChatList {
 		return true
 	})
 	l.search.AddController(searchKeys)
+
+	listKeys := gtk.NewEventControllerKey() // vim keys on top of the list's own arrows
+	listKeys.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
+		if state&(gdk.ControlMask|gdk.AltMask) != 0 {
+			return false
+		}
+		switch keyval {
+		case gdk.KEY_j:
+			l.stepFocus(1)
+		case gdk.KEY_k:
+			l.stepFocus(-1)
+		case gdk.KEY_g:
+			l.stepFocus(-1 << 20)
+		case gdk.KEY_G:
+			l.stepFocus(1 << 20)
+		case gdk.KEY_l, gdk.KEY_o: // open, like Enter
+			if f := l.list.FocusChild(); f != nil {
+				w.openChat(gtk.BaseWidget(f).Name())
+			}
+		case gdk.KEY_slash:
+			l.search.GrabFocus()
+		default:
+			return false
+		}
+		return true
+	})
+	l.list.AddController(listKeys)
 	l.list.SetFilterFunc(func(row *gtk.ListBoxRow) bool {
 		q := strings.ToLower(l.search.Text())
 		r := l.rows[row.Name()]
@@ -217,12 +246,55 @@ func (l *ChatList) avatar(chat string) *gdk.Texture {
 		glib.IdleAdd(func() {
 			if tex, err := gdk.NewTextureFromFilename(path); err == nil {
 				l.avatars[chat] = tex
+				for _, av := range l.waiters[chat] {
+					av.SetCustomImage(tex)
+				}
+				delete(l.waiters, chat)
 				l.reload()
 				l.w.conv.refreshTitle()
 			}
 		})
 	}()
 	return nil
+}
+
+// attach gives an avatar widget anywhere in the window a person's picture,
+// now if loaded, else when it arrives.
+func (l *ChatList) attach(jid string, av *adw.Avatar) {
+	if tex := l.avatar(jid); tex != nil {
+		av.SetCustomImage(tex)
+		return
+	}
+	l.waiters[jid] = append(l.waiters[jid], av)
+}
+
+// stepFocus moves keyboard focus d visible rows down (up when negative),
+// stopping at either end.
+func (l *ChatList) stepFocus(d int) {
+	cur := 0
+	if f := l.list.FocusChild(); f != nil {
+		if r := l.rows[gtk.BaseWidget(f).Name()]; r != nil {
+			cur = r.row.Index()
+		}
+	}
+	step := 1
+	if d < 0 {
+		step, d = -1, -d
+	}
+	var target *gtk.ListBoxRow
+	for i := cur + step; d > 0 && i >= 0; i += step {
+		row := l.list.RowAtIndex(i)
+		if row == nil {
+			break
+		}
+		if row.ChildVisible() {
+			target = row
+			d--
+		}
+	}
+	if target != nil {
+		target.GrabFocus()
+	}
 }
 
 // firstVisible is the top row the search has not hidden.
