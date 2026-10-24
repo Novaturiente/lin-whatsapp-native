@@ -24,7 +24,11 @@ func (c *Conversation) menu(anchor *gtk.Box, m *store.Message, x, y float64) {
 	pop.SetParent(anchor)
 	at := gdk.NewRectangle(int(x), int(y), 1, 1)
 	pop.SetPointingTo(&at)
-	pop.ConnectClosed(func() { glib.IdleAdd(pop.Unparent) })
+	c.menuOpen = true
+	pop.ConnectClosed(func() {
+		c.menuOpen = false
+		glib.IdleAdd(pop.Unparent)
+	})
 	col := gtk.NewBox(gtk.OrientationVertical, 2)
 	pop.SetChild(col)
 	act := func(label string, f func()) {

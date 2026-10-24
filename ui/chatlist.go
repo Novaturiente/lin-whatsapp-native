@@ -54,6 +54,26 @@ func newChatList(w *Window) *ChatList {
 	l.search.SetMarginEnd(8)
 	l.search.SetMarginBottom(6)
 	l.search.ConnectSearchChanged(l.list.InvalidateFilter)
+	l.search.ConnectActivate(func() { // Enter opens the first match
+		if row := l.firstVisible(); row != nil {
+			w.openChat(row.Name())
+		}
+	})
+	l.search.ConnectStopSearch(func() { // Esc leaves search for the open chat
+		l.search.SetText("")
+		w.conv.composer.focus()
+	})
+	searchKeys := gtk.NewEventControllerKey()
+	searchKeys.ConnectKeyPressed(func(keyval, _ uint, _ gdk.ModifierType) bool {
+		if keyval != gdk.KEY_Down {
+			return false
+		}
+		if row := l.firstVisible(); row != nil { // into the results, like a launcher
+			row.GrabFocus()
+		}
+		return true
+	})
+	l.search.AddController(searchKeys)
 	l.list.SetFilterFunc(func(row *gtk.ListBoxRow) bool {
 		q := strings.ToLower(l.search.Text())
 		r := l.rows[row.Name()]
@@ -203,6 +223,16 @@ func (l *ChatList) avatar(chat string) *gdk.Texture {
 		})
 	}()
 	return nil
+}
+
+// firstVisible is the top row the search has not hidden.
+func (l *ChatList) firstVisible() *gtk.ListBoxRow {
+	for i := 0; ; i++ {
+		row := l.list.RowAtIndex(i)
+		if row == nil || row.ChildVisible() {
+			return row
+		}
+	}
 }
 
 // at is the entry for a row of a list built in the same order.

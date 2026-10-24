@@ -39,10 +39,17 @@ type Conversation struct {
 	storeEnd bool       // every stored message is shown; older ones are on the phone
 	asking   *gtk.Label // "Loading older messages…" while the phone is asked
 	askGen   int        // which request a timeout belongs to
-	phoneEnd bool       // the phone answered with nothing older
-	timer    *gtk.Label // ⏱ when disappearing messages are on
-	composer *Composer
-	typers   map[string]time.Time
+	cursor   *gtk.Box   // the message the keyboard acts on
+	menuOpen bool       // a message menu is up; the pane's letter keys stand down
+
+	searchBar   *gtk.SearchBar
+	searchEntry *gtk.SearchEntry
+	searchCount *gtk.Label
+	hits        []*store.Message // search matches, newest first
+	hit         int
+	phoneEnd    bool // the phone answered with nothing older
+	composer    *Composer
+	typers      map[string]time.Time
 }
 
 func newConversation(w *Window) *Conversation {
@@ -52,11 +59,9 @@ func newConversation(w *Window) *Conversation {
 	header := adw.NewHeaderBar()
 	c.avatar = adw.NewAvatar(32, "", true)
 	header.PackStart(c.avatar)
-	c.timer = gtk.NewLabel("⏱")
-	c.timer.SetVisible(false)
-	header.PackEnd(c.timer)
 	header.SetTitleWidget(c.title)
 	c.root.AddTopBar(header)
+	c.root.AddTopBar(c.buildSearch())
 
 	c.box.SetMarginStart(12)
 	c.box.SetMarginEnd(12)
@@ -67,6 +72,12 @@ func newConversation(w *Window) *Conversation {
 	c.scroll.SetChild(c.box)
 	c.scroll.SetVExpand(true)
 	c.scroll.AddCSSClass("conversation")
+	c.scroll.SetFocusable(true) // the messages pane takes arrow keys; see messagesKey
+	msgKeys := gtk.NewEventControllerKey()
+	msgKeys.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
+		return c.messagesKey(keyval, state)
+	})
+	c.scroll.AddController(msgKeys)
 	c.scroll.VAdjustment().ConnectValueChanged(func() {
 		if c.scroll.VAdjustment().Value() < 300 {
 			c.loadOlder()
@@ -108,6 +119,8 @@ func (c *Conversation) open(chat string) {
 	c.chat, c.oldest, c.typers, c.storeEnd, c.asking, c.loading = chat, nil, map[string]time.Time{}, false, nil, false
 	c.phoneEnd = false
 	c.askGen++
+	c.cursor, c.hits, c.hit = nil, nil, -1
+	c.searchBar.SetSearchMode(false)
 	for child := c.box.FirstChild(); child != nil; child = c.box.FirstChild() {
 		c.box.Remove(child)
 	}
@@ -138,12 +151,6 @@ func (c *Conversation) refreshTitle() {
 		c.avatar.SetCustomImage(tex)
 	} else {
 		c.avatar.SetCustomImage(nil)
-	}
-	if ch, _ := c.w.c.Store.Chat(c.chat); ch.Ephemeral > 0 {
-		c.timer.SetTooltipText("Disappearing messages: " + (time.Duration(ch.Ephemeral) * time.Second).String())
-		c.timer.SetVisible(true)
-	} else {
-		c.timer.SetVisible(false)
 	}
 	c.showTyping()
 }
@@ -202,11 +209,21 @@ func (c *Conversation) loadOlder() {
 	if c.loading || c.oldest == nil {
 		return
 	}
+	if !c.loadOlderPage() {
+		c.askPhone()
+	}
+}
+
+// loadOlderPage shows the next older page from the store; false when the
+// store has no more.
+func (c *Conversation) loadOlderPage() bool {
+	if c.oldest == nil {
+		return false
+	}
 	page, _ := c.w.c.Store.Messages(c.chat, c.oldest, pageSize)
 	if len(page) == 0 {
 		c.storeEnd = true
-		c.askPhone()
-		return
+		return false
 	}
 	c.loading = true
 	a := c.scroll.VAdjustment()
@@ -219,6 +236,7 @@ func (c *Conversation) loadOlder() {
 		a.SetValue(a.Value() + a.Upper() - upper)
 		c.loading = false
 	})
+	return true
 }
 
 // askPhone requests messages older than everything stored, as WhatsApp Web
@@ -310,6 +328,8 @@ func (c *Conversation) update(id string) {
 
 func (c *Conversation) slot(m *store.Message) *gtk.Box {
 	slot := gtk.NewBox(gtk.OrientationHorizontal, 0)
+	slot.AddCSSClass("slot")
+	slot.SetName(m.ID) // gotk4 wrappers differ per call; the name is the key
 	slot.Append(c.bubble(m))
 	c.slots[m.ID] = slot
 	return slot
@@ -515,28 +535,55 @@ func (c *Conversation) quote(m *store.Message) gtk.Widgetter {
 	box.Append(who)
 	box.Append(text)
 	click := gtk.NewGestureClick()
-	click.ConnectReleased(func(int, float64, float64) { c.jumpTo(m.QuoteID) })
+	click.ConnectReleased(func(int, float64, float64) {
+		if !c.jumpTo(m.QuoteID) {
+			c.w.toast("That message is not on this computer")
+		}
+	})
 	box.AddController(click)
 	return box
 }
 
 // jumpTo scrolls to a loaded message, loading older pages until it appears.
-func (c *Conversation) jumpTo(id string) {
-	for range 20 {
-		if slot, ok := c.slots[id]; ok {
-			glib.IdleAdd(func() {
-				if r, ok := slot.ComputeBounds(c.box); ok {
-					c.scroll.VAdjustment().SetValue(float64(r.Y()) - 80)
-				}
-			})
-			return
-		}
-		if c.oldest == nil || c.storeEnd {
-			return
-		}
-		c.loading = false
-		c.loadOlder()
+// It reports whether the message was found.
+func (c *Conversation) jumpTo(id string) bool {
+	if m, _ := c.w.c.Store.Message(c.chat, id); m == nil {
+		return false // never stored: paging back would build the whole history for nothing
 	}
+	for pages := 0; ; pages++ {
+		if slot, ok := c.slots[id]; ok {
+			glib.TimeoutAdd(60, func() bool { // after the pages just added have a size
+				c.centre(slot)
+				c.flash(slot)
+				return false
+			})
+			return true
+		}
+		if pages == 50 { // 3000 messages back; more would freeze the window
+			c.w.toast("That message is too far back to show here")
+			return true
+		}
+		if !c.loadOlderPage() {
+			return false
+		}
+	}
+}
+
+// centre scrolls a message to the middle of the view.
+func (c *Conversation) centre(w gtk.Widgetter) {
+	if r, ok := gtk.BaseWidget(w).ComputeBounds(c.box); ok {
+		a := c.scroll.VAdjustment()
+		a.SetValue(float64(r.Y()) + float64(r.Height())/2 - a.PageSize()/2)
+	}
+}
+
+// flash tints a message's row for a moment, so the eye finds it.
+func (c *Conversation) flash(slot *gtk.Box) {
+	slot.AddCSSClass("flash")
+	glib.TimeoutAdd(1600, func() bool {
+		slot.RemoveCSSClass("flash")
+		return false
+	})
 }
 
 func (c *Conversation) meta(m *store.Message) gtk.Widgetter {

@@ -160,8 +160,6 @@ func (c *Client) handle(raw any) {
 	case *events.LoggedOut:
 		c.OnEvent(Event{Kind: EvConnection, Text: "This device was unlinked. Restart the app to link it again."})
 		c.OnEvent(Event{Kind: EvLoggedOut})
-	case *events.CallOffer:
-		c.missedCall(ctx, e)
 	case *events.PushName, *events.Contact, *events.BusinessName:
 		c.forgetNames()
 	case *events.GroupInfo:
@@ -209,9 +207,8 @@ func (c *Client) message(ctx context.Context, e *events.Message, live bool) {
 	}
 	var target string
 	switch {
-	case u.Timer != nil:
+	case u.Timer != nil: // kept silently: sends must carry the timer the chat uses
 		_ = c.Store.SetEphemeral(chat, *u.Timer)
-		c.system(chat, e.Info.ID, e.Info.Timestamp, c.Name(sender)+" "+timerText(*u.Timer), live)
 		return
 	case u.Msg != nil:
 		u.Msg.RawChat, u.Msg.RawSender = e.Info.Chat.ToNonAD().String(), e.Info.Sender.ToNonAD().String()
@@ -389,22 +386,6 @@ func (c *Client) system(chat, id string, at time.Time, text string, live bool) b
 	return true
 }
 
-func timerText(seconds uint32) string {
-	if seconds == 0 {
-		return "turned off disappearing messages"
-	}
-	var d string
-	switch {
-	case seconds%86400 == 0:
-		d = fmt.Sprintf("%d days", seconds/86400)
-	case seconds%3600 == 0:
-		d = fmt.Sprintf("%d hours", seconds/3600)
-	default:
-		d = (time.Duration(seconds) * time.Second).String()
-	}
-	return "turned on disappearing messages: new messages disappear after " + strings.Replace(d, "1 days", "24 hours", 1)
-}
-
 // groupChange turns a group notification into notice lines, and keeps the
 // stored name and timer current.
 func (c *Client) groupChange(ctx context.Context, e *events.GroupInfo) {
@@ -437,7 +418,6 @@ func (c *Client) groupChange(ctx context.Context, e *events.GroupInfo) {
 			t = 0
 		}
 		_ = c.Store.SetEphemeral(chat, t)
-		lines = append(lines, who+" "+timerText(t))
 	}
 	if e.Announce != nil {
 		if e.Announce.IsAnnounce {
@@ -522,47 +502,8 @@ func (c *Client) stubText(ctx context.Context, wm *waWeb.WebMessageInfo) string 
 		return list + " is now an admin"
 	case waWeb.WebMessageInfo_GROUP_PARTICIPANT_DEMOTE:
 		return list + " is no longer an admin"
-	case waWeb.WebMessageInfo_CALL_MISSED_VOICE:
-		return "Missed voice call"
-	case waWeb.WebMessageInfo_CALL_MISSED_VIDEO:
-		return "Missed video call"
-	case waWeb.WebMessageInfo_CHANGE_EPHEMERAL_SETTING:
-		var secs uint32
-		fmt.Sscan(first, &secs)
-		return who + " " + timerText(secs)
 	}
-	return ""
-}
-
-// missedCall notes an incoming call. This client never answers calls; the
-// phone rings and may answer, so the line says only that a call came.
-// History later adds WhatsApp's own "Missed call" line when it was missed.
-func (c *Client) missedCall(ctx context.Context, e *events.CallOffer) {
-	kind := "voice"
-	if e.Data != nil {
-		if _, ok := e.Data.GetOptionalChildByTag("video"); ok {
-			kind = "video"
-		}
-	}
-	caller := e.CallCreator
-	if caller.Server == types.HiddenUserServer && !e.CallCreatorAlt.IsEmpty() {
-		caller = e.CallCreatorAlt // the phone number, when the LID is not mapped yet
-	}
-	if caller.IsEmpty() {
-		caller = e.From
-	}
-	from := c.normalize(ctx, caller).String()
-	chat := from
-	if !e.GroupJID.IsEmpty() {
-		chat = e.GroupJID.String()
-	}
-	text := fmt.Sprintf("📞 Incoming %s call from %s. Answer it on your phone.", kind, c.Name(from))
-	id := "call-" + e.CallID
-	if !c.system(chat, id, e.Timestamp, text, false) {
-		return // a repeat of an offer already shown
-	}
-	m, _ := c.Store.Message(chat, id)
-	c.OnEvent(Event{Kind: EvMessage, Chat: chat, ID: id, Notify: m})
+	return "" // calls and timer changes are not shown, by choice
 }
 
 // keySender is who a message key says sent something, normalised.

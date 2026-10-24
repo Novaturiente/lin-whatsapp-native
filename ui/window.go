@@ -4,7 +4,10 @@ package ui
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
@@ -19,7 +22,13 @@ import (
 const css = `
 .bubble { padding: 6px 10px; border-radius: 12px; }
 .bubble.in { background: alpha(@card_bg_color, 1); box-shadow: 0 1px 1px alpha(black, .08); }
-.bubble.out { background: alpha(@accent_bg_color, .18); }
+.bubble.out { background: #005c4b; color: #e9edef; }
+.bubble.out .quote { background: alpha(black, .18); }
+.bubble.out .meta { opacity: .75; }
+.slot { border-radius: 8px; transition: background 500ms ease-out; }
+.slot.flash { background: alpha(@accent_bg_color, .35); transition: none; }
+.slot.cursor { background: alpha(@window_fg_color, .10); }
+searchbar.chat-search > revealer > box { padding: 4px 8px; }
 .quote { padding: 4px 8px; border-left: 3px solid @accent_color; border-radius: 6px;
 	background: alpha(@window_fg_color, .06); }
 .sender { font-weight: bold; color: @accent_color; font-size: smaller; }
@@ -31,6 +40,31 @@ const css = `
 .system { font-size: small; padding: 3px 10px; margin: 4px 0; border-radius: 8px;
 	background: alpha(@window_fg_color, .07); opacity: .85; }
 `
+
+// transparentCSS clears every pane's own background, so only the window's
+// translucent one shows; bubbles, the composer and popovers stay solid.
+// %.2f is the window's opacity. Scoped to the main window (class "main"):
+// the media viewer keeps a solid background behind photos.
+const transparentCSS = `
+window.main.background { background-color: alpha(@window_bg_color, %.2f); }
+window.main toolbarview, window.main headerbar, window.main .navigation-sidebar,
+window.main list, window.main scrolledwindow, window.main viewport,
+window.main navigation-split-view > *, window.main .sidebar-pane, window.main .content-pane,
+window.main statuspage, window.main .conversation, window.main searchbar > revealer > box,
+window.main banner > revealer > widget {
+	background: transparent; box-shadow: none; }
+window.main headerbar { border-bottom: 1px solid alpha(@window_fg_color, .08); }
+`
+
+// opacity is LINWA_OPACITY (0.3 to 1): how solid the window background is.
+// 1 turns transparency off.
+func opacity() float64 {
+	v, err := strconv.ParseFloat(os.Getenv("LINWA_OPACITY"), 64)
+	if err != nil {
+		return 0.85
+	}
+	return min(max(v, 0.3), 1)
+}
 
 type Window struct {
 	win    *adw.ApplicationWindow
@@ -46,11 +80,16 @@ type Window struct {
 
 func New(app *adw.Application, c *wa.Client) *Window {
 	provider := gtk.NewCSSProvider()
-	provider.LoadFromString(css)
+	style := css
+	if o := opacity(); o < 1 {
+		style += fmt.Sprintf(transparentCSS, o)
+	}
+	provider.LoadFromString(style)
 	gtk.StyleContextAddProviderForDisplay(gdk.DisplayGetDefault(), provider, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
 	w := &Window{win: adw.NewApplicationWindow(&app.Application), c: c}
 	w.win.SetTitle("WhatsApp")
+	w.win.AddCSSClass("main")
 	w.win.SetDefaultSize(1100, 760)
 	w.toasts = adw.NewToastOverlay()
 
@@ -90,20 +129,9 @@ func (w *Window) Present() { w.win.Present() }
 
 func (w *Window) bindKeys() {
 	keys := gtk.NewEventControllerKey()
+	keys.SetPropagationPhase(gtk.PhaseCapture) // ahead of the text box, which would eat Ctrl+K
 	keys.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
-		ctrl := state&gdk.ControlMask != 0
-		switch {
-		case ctrl && (keyval == gdk.KEY_q || keyval == gdk.KEY_w):
-			w.win.Close()
-		case ctrl && keyval == gdk.KEY_f:
-			w.chats.search.GrabFocus()
-		case ctrl && state&gdk.AltMask != 0 && (keyval == gdk.KEY_n || keyval == gdk.KEY_N):
-			w.newChat()
-		case keyval == gdk.KEY_Escape && w.conv.cancelCompose():
-		default:
-			return false
-		}
-		return true
+		return w.windowKey(keyval, state)
 	})
 	w.win.AddController(keys)
 }

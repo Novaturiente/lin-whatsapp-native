@@ -31,6 +31,12 @@ func TestMigrateKeepsOldData(t *testing.T) {
 		mentions, status) VALUES ('c','old','s',0,1,'text','kept','','',0,0,0,'[]',0,'','','','[]',1)`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := old.Exec(`INSERT INTO messages (chat, id, sender, from_me, ts, kind, text, file_name,
+		mime, voice, animated, view_once, options, multi_vote, quote_id, quote_sender, quote_text,
+		mentions, status) VALUES ('c','call-1','c',0,2,'system','📞 Incoming voice call from X','','',0,0,0,'[]',0,'','','','[]',1);
+		INSERT INTO chats (jid, last_ts, last_text) VALUES ('c', 2, '📞 Incoming voice call from X')`); err != nil {
+		t.Fatal(err)
+	}
 	old.Close()
 
 	s, err := Open(path)
@@ -40,6 +46,12 @@ func TestMigrateKeepsOldData(t *testing.T) {
 	defer s.Close()
 	if m, err := s.Message("c", "old"); err != nil || m == nil || m.Text != "kept" {
 		t.Fatalf("old message after migration: %+v %v", m, err)
+	}
+	if m, _ := s.Message("c", "call-1"); m != nil {
+		t.Fatalf("call notice survived migration 2")
+	}
+	if ch, _ := s.Chat("c"); ch.LastText != "kept" {
+		t.Fatalf("chat preview still %q", ch.LastText)
 	}
 	if err := s.SetEphemeral("c", 86400); err != nil {
 		t.Fatal(err)
@@ -68,6 +80,21 @@ func TestSystemLinesStayOutOfReceipts(t *testing.T) {
 	s.SetEphemeral("empty@s.whatsapp.net", 0)
 	if chats, _ := s.Chats(); len(chats) != 1 {
 		t.Fatalf("a zero timer created a chat: %+v", chats)
+	}
+}
+
+func TestSearch(t *testing.T) {
+	s := open(t)
+	c := "1@s.whatsapp.net"
+	s.AddMessage(msg("a", 1, "Meeting at 5"), false)
+	s.AddMessage(msg("b", 2, "no meeting today"), false)
+	s.AddMessage(msg("c", 3, "100% sure"), false)
+	s.AddMessage(msg("d", 4, "1000 sure"), false)
+	if got, _ := s.Search(c, "MEETING", 10); len(got) != 2 || got[0].ID != "b" {
+		t.Fatalf("case-insensitive, newest first: %+v", got)
+	}
+	if got, _ := s.Search(c, "100%", 10); len(got) != 1 || got[0].ID != "c" {
+		t.Fatalf("%% must match literally: %+v", got)
 	}
 }
 

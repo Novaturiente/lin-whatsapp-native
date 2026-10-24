@@ -23,6 +23,7 @@ type viewer struct {
 	fit   bool
 	copy  *gtk.Button
 	video *gtk.Video
+	zoom  func() // toggles fit and 1:1 on the shown photo; nil for videos
 }
 
 func (c *Conversation) view(m *store.Message) {
@@ -46,16 +47,21 @@ func (c *Conversation) view(m *store.Message) {
 		b.ConnectClicked(f)
 		return b
 	}
-	header.PackStart(button("go-previous-symbolic", "Previous (←)", func() { v.step(-1) }))
-	header.PackStart(button("go-next-symbolic", "Next (→)", func() { v.step(1) }))
-	header.PackEnd(button("document-save-symbolic", "Save to Downloads (Ctrl+S)", func() { c.save(v.cur()) }))
-	v.copy = button("edit-copy-symbolic", "Copy image (Ctrl+C)", func() { c.copyImage(v.cur()) })
+	header.PackStart(button("go-previous-symbolic", "Previous (← or h)", func() { v.step(-1) }))
+	header.PackStart(button("go-next-symbolic", "Next (→ or l)", func() { v.step(1) }))
+	header.PackEnd(button("document-save-symbolic", "Download (d)", func() { c.save(v.cur()) }))
+	v.copy = button("edit-copy-symbolic", "Copy image (c)", func() { c.copyImage(v.cur()) })
 	header.PackEnd(v.copy)
-	header.PackEnd(button("document-open-symbolic", "Open in another app", func() { c.openFile(v.cur()) }))
-	header.PackEnd(button("mail-reply-sender-symbolic", "Reply", func() { v.win.Close(); c.composer.replyTo(v.cur()) }))
+	header.PackEnd(button("document-open-symbolic", "Open in another app (o)", func() { c.openFile(v.cur()) }))
+	header.PackEnd(button("mail-reply-sender-symbolic", "Reply (r)", func() { v.win.Close(); c.composer.replyTo(v.cur()) }))
+	help := gtk.NewLabel("← → browse · f zoom · d download · o open · c copy · r reply · space play · q close")
+	help.AddCSSClass("meta")
+	help.SetMarginTop(4)
+	help.SetMarginBottom(6)
 
 	toolbar := adw.NewToolbarView()
 	toolbar.AddTopBar(header)
+	toolbar.AddBottomBar(help)
 	toolbar.SetContent(v.body)
 	v.body.SetVExpand(true)
 	v.win.SetContent(toolbar)
@@ -65,19 +71,31 @@ func (c *Conversation) view(m *store.Message) {
 	v.win.Maximize()
 
 	keys := gtk.NewEventControllerKey()
+	keys.SetPropagationPhase(gtk.PhaseCapture) // before the video controls take arrows and space
 	keys.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		ctrl := state&gdk.ControlMask != 0
 		switch {
-		case keyval == gdk.KEY_Escape:
+		case keyval == gdk.KEY_Escape || keyval == gdk.KEY_q:
 			v.win.Close()
-		case keyval == gdk.KEY_Left:
+		case keyval == gdk.KEY_Left || keyval == gdk.KEY_h || keyval == gdk.KEY_k:
 			v.step(-1)
-		case keyval == gdk.KEY_Right:
+		case keyval == gdk.KEY_Right || keyval == gdk.KEY_l || keyval == gdk.KEY_j:
 			v.step(1)
-		case ctrl && keyval == gdk.KEY_s:
+		case keyval == gdk.KEY_Home || keyval == gdk.KEY_g:
+			v.step(-v.i)
+		case keyval == gdk.KEY_End || keyval == gdk.KEY_G:
+			v.step(len(v.items) - 1 - v.i)
+		case keyval == gdk.KEY_d || ctrl && keyval == gdk.KEY_s:
 			c.save(v.cur())
-		case ctrl && keyval == gdk.KEY_c && v.cur().Kind == store.KindImage:
+		case keyval == gdk.KEY_o:
+			c.openFile(v.cur())
+		case keyval == gdk.KEY_r:
+			v.win.Close()
+			c.composer.replyTo(v.cur())
+		case (keyval == gdk.KEY_c || ctrl && keyval == gdk.KEY_c) && v.cur().Kind == store.KindImage:
 			c.copyImage(v.cur())
+		case (keyval == gdk.KEY_f || keyval == gdk.KEY_z) && v.zoom != nil:
+			v.zoom()
 		case keyval == gdk.KEY_space && v.video != nil:
 			if s := v.video.MediaStream(); s != nil {
 				b := gtk.BaseMediaStream(s)
@@ -114,6 +132,7 @@ func (v *viewer) show() {
 	v.title.SetTitle(who)
 	v.title.SetSubtitle(fmt.Sprintf("%s · %d of %d", m.Time.Format("2 Jan 2006, 15:04"), v.i+1, len(v.items)))
 	v.copy.SetVisible(m.Kind == store.KindImage)
+	v.zoom = nil
 	if v.video != nil { // stop the previous video's sound
 		if s := v.video.MediaStream(); s != nil {
 			gtk.BaseMediaStream(s).Pause()
@@ -159,8 +178,9 @@ func (v *viewer) picture(m *store.Message, path string) {
 		}
 	}
 	apply()
+	v.zoom = func() { v.fit = !v.fit; apply() }
 	click := gtk.NewGestureClick()
-	click.ConnectReleased(func(int, float64, float64) { v.fit = !v.fit; apply() })
+	click.ConnectReleased(func(int, float64, float64) { v.zoom() })
 	pic.AddController(click)
 	pic.SetTooltipText("Click to zoom")
 	v.body.SetChild(pic)

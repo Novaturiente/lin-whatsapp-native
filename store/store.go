@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -130,6 +131,12 @@ var migrations = []string{
 	ALTER TABLE messages ADD COLUMN link_url TEXT NOT NULL DEFAULT '';
 	ALTER TABLE messages ADD COLUMN link_title TEXT NOT NULL DEFAULT '';
 	ALTER TABLE messages ADD COLUMN link_desc TEXT NOT NULL DEFAULT '';`,
+	// call and timer notices were dropped from the client
+	`DELETE FROM messages WHERE kind = 'system' AND (id LIKE 'call-%'
+		OR text LIKE '%disappearing messages%' OR text LIKE 'Missed %call');
+	UPDATE chats SET last_text = COALESCE((SELECT text FROM messages m WHERE m.chat = chats.jid
+		AND m.deleted = 0 ORDER BY ts DESC, rowid DESC LIMIT 1), '')
+	WHERE last_text LIKE '%call%' OR last_text LIKE '%disappearing messages%';`,
 }
 
 func migrate(db *sql.DB) error {
@@ -296,6 +303,28 @@ func (s *Store) Messages(chat string, before *Message, limit int) ([]*Message, e
 			return nil, err
 		}
 		out = append([]*Message{m}, out...)
+	}
+	return out, rows.Err()
+}
+
+// Search finds messages in a chat whose text, caption or file name contains
+// q (any case), newest first.
+func (s *Store) Search(chat, q string, limit int) ([]*Message, error) {
+	like := "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(q) + "%"
+	rows, err := s.db.Query(`SELECT `+cols+` FROM messages WHERE chat = ? AND deleted = 0
+		AND kind != ? AND (text LIKE ? ESCAPE '\' OR file_name LIKE ? ESCAPE '\')
+		ORDER BY ts DESC, rowid DESC LIMIT ?`, chat, KindSystem, like, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Message
+	for rows.Next() {
+		m, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }

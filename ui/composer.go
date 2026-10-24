@@ -27,6 +27,8 @@ type Composer struct {
 	banner   *gtk.Box // "Replying to…" / "Editing"
 	bannerTx *gtk.Label
 	view     *gtk.TextView
+	scroll   *gtk.ScrolledWindow
+	fitted   bool // the height cap uses the measured line height
 	send     *gtk.Button
 	mic      *gtk.Button
 	recBox   *gtk.Box
@@ -78,17 +80,21 @@ func newComposer(c *Conversation) *Composer {
 
 	k.view.SetWrapMode(gtk.WrapWordChar)
 	k.view.SetAcceptsTab(false)
-	k.view.SetTopMargin(8)
-	k.view.SetBottomMargin(8)
+	k.view.SetTopMargin(6)
+	k.view.SetBottomMargin(6)
 	k.view.SetLeftMargin(10)
 	k.view.SetRightMargin(10)
 	k.view.AddCSSClass("card")
-	scroll := gtk.NewScrolledWindow()
-	scroll.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
-	scroll.SetPropagateNaturalHeight(true)
-	scroll.SetMaxContentHeight(160)
-	scroll.SetHExpand(true)
-	scroll.SetChild(k.view)
+	k.scroll = gtk.NewScrolledWindow()
+	// External: no scrollbar, whose minimum height made the empty box two
+	// lines tall. The box follows the text up to maxLines; see fit.
+	k.scroll.SetPolicy(gtk.PolicyNever, gtk.PolicyExternal)
+	k.scroll.SetPropagateNaturalHeight(true)
+	k.scroll.SetMaxContentHeight(maxLines*20 + 12) // until fit measures the real line height
+	k.scroll.SetHExpand(true)
+	k.scroll.SetVAlign(gtk.AlignEnd)
+	k.scroll.SetChild(k.view)
+	scroll := k.scroll
 	row.Append(scroll)
 
 	k.send = gtk.NewButtonFromIconName("paper-plane-symbolic")
@@ -203,6 +209,21 @@ func (k *Composer) changed() {
 		k.startTyping()
 	}
 	k.updateMentions()
+	glib.IdleAdd(k.fit) // after the view has laid out the new text
+}
+
+// maxLines is how tall the box grows before it scrolls instead.
+const maxLines = 10
+
+// fit caps the box at maxLines of the current font; past that it scrolls.
+func (k *Composer) fit() {
+	if k.fitted {
+		return
+	}
+	if lineH := k.view.IterLocation(k.view.Buffer().StartIter()).Height(); lineH > 0 {
+		k.scroll.SetMaxContentHeight(maxLines*lineH + k.view.TopMargin() + k.view.BottomMargin())
+		k.fitted = true
+	}
 }
 
 func (k *Composer) startTyping() {
@@ -241,6 +262,13 @@ func (k *Composer) key(keyval, _ uint, state gdk.ModifierType) bool {
 		return true
 	case ctrl && keyval == gdk.KEY_v:
 		return k.paste()
+	case keyval == gdk.KEY_Up && strings.TrimSpace(k.text()) == "":
+		return k.c.focusMessages() // like a terminal: up leaves the empty prompt
+	case keyval == gdk.KEY_Escape:
+		if !k.cancel() {
+			k.c.focusMessages()
+		}
+		return true
 	}
 	return false
 }
