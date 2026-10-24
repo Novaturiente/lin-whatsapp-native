@@ -279,10 +279,29 @@ func (k *Composer) stopTyping() {
 
 func (k *Composer) key(keyval, _ uint, state gdk.ModifierType) bool {
 	ctrl := state&gdk.ControlMask != 0
+	if k.mentionPop.Visible() {
+		row := k.mentionList.SelectedRow()
+		i := 0
+		if row != nil {
+			i = row.Index()
+		}
+		switch keyval {
+		case gdk.KEY_Up, gdk.KEY_Down:
+			if keyval == gdk.KEY_Up {
+				i--
+			} else {
+				i++
+			}
+			if i >= 0 && i < len(k.hits) {
+				k.mentionList.SelectRow(k.mentionList.RowAtIndex(i))
+			}
+			return true
+		case gdk.KEY_Return, gdk.KEY_KP_Enter, gdk.KEY_Tab:
+			k.pickMention(i)
+			return true
+		}
+	}
 	switch {
-	case k.mentionPop.Visible() && (keyval == gdk.KEY_Return || keyval == gdk.KEY_Tab):
-		k.pickMention(0)
-		return true
 	case keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter:
 		if state&gdk.ShiftMask != 0 {
 			return false // newline
@@ -377,7 +396,9 @@ func (k *Composer) updateMentions() {
 		hits = hits[:8]
 	}
 	k.hits, k.query = hits, query
+	k.mentionList.SelectRow(k.mentionList.RowAtIndex(0))
 	k.mentionPop.Popup()
+	k.view.GrabFocus() // keep typing and arrow keys in the composer's key controller
 }
 
 // pickMention replaces the typed "@query" with the chosen member's name.
