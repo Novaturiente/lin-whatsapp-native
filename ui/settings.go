@@ -106,6 +106,17 @@ func (w *Window) applySettings() {
 	w.conv.resizeBubbles()
 }
 
+// zoom steps the message text size by d points; 0 goes back to the default.
+func (w *Window) zoom(d float64) {
+	size := defaults().FontSize
+	if d != 0 {
+		size = min(max(w.set.FontSize+d, 8), 24) // the range loadSettings allows
+	}
+	w.set.FontSize = size
+	w.changed()
+	w.toast(fmt.Sprintf("Text size %.1f pt", size))
+}
+
 // changed applies and saves after any edit in the dialog.
 func (w *Window) changed() {
 	w.applySettings()

@@ -23,6 +23,7 @@ const shortcutsHelp = `Panes
   Alt+↑ / Alt+↓           previous / next chat
   Ctrl+K                  search chats (↓ then Enter opens)
   Ctrl+,                  settings
+  Ctrl+= / Ctrl+- / Ctrl+0  bigger / smaller / default text
 
 Chat list
   ↑ ↓ or k j, g G         move          Enter, o or l   open
@@ -76,6 +77,12 @@ func (w *Window) windowKey(keyval uint, state gdk.ModifierType) bool {
 		w.focusChats(true)
 	case ctrl && keyval == gdk.KEY_comma:
 		w.openSettings()
+	case ctrl && (keyval == gdk.KEY_equal || keyval == gdk.KEY_plus || keyval == gdk.KEY_KP_Add):
+		w.zoom(1)
+	case ctrl && (keyval == gdk.KEY_minus || keyval == gdk.KEY_KP_Subtract):
+		w.zoom(-1)
+	case ctrl && (keyval == gdk.KEY_0 || keyval == gdk.KEY_KP_0):
+		w.zoom(0)
 	case ctrl && !alt && keyval == gdk.KEY_f:
 		w.conv.openSearch()
 	case ctrl && alt && (keyval == gdk.KEY_n || keyval == gdk.KEY_N):
