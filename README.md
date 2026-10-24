@@ -52,6 +52,17 @@ downloaded files.
 Shown but not openable: view-once media (WhatsApp keeps it off linked devices),
 contact cards, and message types whatsmeow does not know yet.
 
+## Phone checklist: phase 1
+
+- [ ] In a chat with disappearing messages on, the header shows ⏱, and a message sent from here disappears on the phone.
+- [ ] A link sent from the phone shows its preview card here.
+- [ ] A forwarded message shows "↪ Forwarded".
+- [ ] Adding, removing or renaming in a group shows a grey line here.
+- [ ] Calling this number shows "Incoming voice call" here and a notification.
+- [ ] Turning Wi-Fi off shows the "Connecting…" banner; a message sent then shows "⚠ not sent", and "Retry sending" delivers it once back online.
+- [ ] The ✎ button opens a contact by name, and a typed number starts a new chat.
+- [ ] Scrolling to the top of an old chat loads older messages from the phone.
+
 ## Check
 
 ```sh
