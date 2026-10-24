@@ -36,12 +36,14 @@ type Conversation struct {
 	slots      map[string]*gtk.Box // message ID to the row holding its bubble
 	oldest     *store.Message
 	loading    bool
-	storeEnd   bool       // every stored message is shown; older ones are on the phone
-	asking     *gtk.Label // "Loading older messages…" while the phone is asked
-	askGen     int        // which request a timeout belongs to
-	cursor     *gtk.Box   // the message the keyboard acts on
-	lastSender string     // sender of the newest bubble shown, for avatar runs
-	menuOpen   bool       // a message menu is up; the pane's letter keys stand down
+	storeEnd   bool         // every stored message is shown; older ones are on the phone
+	asking     *gtk.Label   // "Loading older messages…" while the phone is asked
+	askGen     int          // which request a timeout belongs to
+	cursor     *gtk.Box     // the message the keyboard acts on
+	lastSender string       // sender of the newest bubble shown, for avatar runs
+	menuOpen   bool         // a message menu is up; the pane's letter keys stand down
+	clamps     []*adw.Clamp // every shown bubble's width cap, resized with the pane
+	bubbleMax  int          // that cap: 75% of the pane's width
 
 	searchBar   *gtk.SearchBar
 	searchEntry *gtk.SearchEntry
@@ -83,6 +85,20 @@ func newConversation(w *Window) *Conversation {
 		return c.messagesKey(keyval, state)
 	})
 	c.scroll.AddController(msgKeys)
+	// GTK has no percentage widths: follow the pane's width through its
+	// horizontal adjustment, whose page size is the visible width.
+	c.bubbleMax = 560
+	c.scroll.HAdjustment().ConnectChanged(func() {
+		max := int(c.scroll.HAdjustment().PageSize() * 0.75)
+		if max < 200 || max == c.bubbleMax {
+			return
+		}
+		c.bubbleMax = max
+		for _, cl := range c.clamps {
+			cl.SetMaximumSize(max)
+			cl.SetTighteningThreshold(max)
+		}
+	})
 	c.scroll.VAdjustment().ConnectValueChanged(func() {
 		if c.scroll.VAdjustment().Value() < 300 {
 			c.loadOlder()
@@ -130,6 +146,7 @@ func (c *Conversation) open(chat string) {
 		c.box.Remove(child)
 	}
 	c.slots = map[string]*gtk.Box{}
+	c.clamps = nil
 	c.stack.SetVisibleChildName("chat")
 	c.composer.root.SetVisible(true)
 	c.composer.reset()
@@ -413,10 +430,11 @@ func (c *Conversation) bubble(m *store.Message) gtk.Widgetter {
 	c.content(col, m)
 	col.Append(c.meta(m))
 
-	// A bubble never spans the pane: long text wraps at about WhatsApp's width.
+	// A bubble grows with its text up to 75% of the pane, then wraps.
 	clamp := adw.NewClamp()
-	clamp.SetMaximumSize(560)
-	clamp.SetTighteningThreshold(560)
+	clamp.SetMaximumSize(c.bubbleMax)
+	clamp.SetTighteningThreshold(c.bubbleMax)
+	c.clamps = append(c.clamps, clamp) // shortcut: edited bubbles leave stale entries until the chat reloads
 	clamp.SetChild(col)
 	clamp.SetHAlign(col.HAlign())
 	outer := gtk.NewBox(gtk.OrientationVertical, 0)
@@ -466,8 +484,8 @@ func (c *Conversation) textLabel(m *store.Message) *gtk.Label {
 	l.SetWrap(true)
 	l.SetWrapMode(pango.WrapWordChar)
 	l.SetSelectable(true)
-	l.SetCanFocus(false) // selectable labels grab focus and select all
-	l.SetMaxWidthChars(60)
+	l.SetCanFocus(false)   // selectable labels grab focus and select all
+	l.SetMaxWidthChars(-1) // natural width is the whole line; the bubble's clamp caps it
 	return l
 }
 

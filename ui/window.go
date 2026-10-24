@@ -25,6 +25,8 @@ const css = `
 .bubble.out { background: #005c4b; color: #e9edef; }
 .bubble.out .quote { background: alpha(black, .18); }
 .bubble.out .meta { opacity: .75; }
+.bubble { font-size: 11.5pt; }
+.bubble label { line-height: 1.35; }
 .slot { border-radius: 8px; transition: background 500ms ease-out; }
 .slot.flash { background: alpha(@accent_bg_color, .35); transition: none; }
 .slot.cursor { background: alpha(@window_fg_color, .10); }
