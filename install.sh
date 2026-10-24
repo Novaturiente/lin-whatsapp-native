@@ -6,12 +6,14 @@ set -eu
 
 REPO=Novaturiente/lin-whatsapp-native
 APP=lin-whatsapp-native
+# Launcher entry and icon are named after the GTK app ID so docks and switchers match the window.
+ID=io.github.nova.LinWhatsappNative
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
 
 if [ "${1:-}" = "--uninstall" ]; then
-	rm -f "$BIN_DIR/$APP" "$APPS_DIR/$APP.desktop" "$ICON_DIR/$APP.svg"
+	rm -f "$BIN_DIR/$APP" "$APPS_DIR/$ID.desktop" "$ICON_DIR/$ID.svg" "$APPS_DIR/$APP.desktop" "$ICON_DIR/$APP.svg"
 	echo "Removed $APP. Chats stay in ~/.local/share/$APP (delete it to unlink this computer)."
 	exit 0
 fi
@@ -34,9 +36,11 @@ done
 
 mkdir -p "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
 install -m 755 "$TMP/$APP-linux-amd64" "$BIN_DIR/$APP"
-install -m 644 "$TMP/icon.svg" "$ICON_DIR/$APP.svg"
+install -m 644 "$TMP/icon.svg" "$ICON_DIR/$ID.svg"
 # Full path: desktop sessions often lack ~/.local/bin in PATH.
-sed "s|^Exec=.*|Exec=$BIN_DIR/$APP|" "$TMP/$APP.desktop" >"$APPS_DIR/$APP.desktop"
+sed "s|^Exec=.*|Exec=$BIN_DIR/$APP|" "$TMP/$APP.desktop" >"$APPS_DIR/$ID.desktop"
+# Files from v0.1.0/v0.1.1 used the short name; drop them to avoid a duplicate launcher entry.
+rm -f "$APPS_DIR/$APP.desktop" "$ICON_DIR/$APP.svg"
 command -v update-desktop-database >/dev/null && update-desktop-database -q "$APPS_DIR" || true
 
 echo "Installed $APP to $BIN_DIR/$APP."
