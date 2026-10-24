@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -160,8 +161,10 @@ func (l *ChatList) rebuild() {
 	}
 	seen := map[string]bool{}
 	changed := false
+	unread := 0
 	for _, c := range chats {
 		seen[c.JID] = true
+		unread += c.Unread
 		name := l.w.c.Name(c.JID)
 		hasAvatar := l.avatar(c.JID) != nil
 		r := l.rows[c.JID]
@@ -188,6 +191,11 @@ func (l *ChatList) rebuild() {
 		l.list.InvalidateSort()
 		l.list.InvalidateFilter()
 	}
+	title := "WhatsApp"
+	if unread > 0 {
+		title = fmt.Sprintf("(%d) WhatsApp", unread)
+	}
+	l.w.win.SetTitle(title)
 	if r := l.rows[l.w.conv.chat]; r != nil {
 		l.list.SelectRow(r.row)
 	}
