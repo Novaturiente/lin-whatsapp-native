@@ -190,7 +190,7 @@ func (l *ChatList) rebuild() {
 }
 
 func (l *ChatList) rowContent(c store.Chat, name string) gtk.Widgetter {
-	avatar := adw.NewAvatar(42, name, true)
+	avatar := adw.NewAvatar(46, name, true)
 	if tex := l.avatar(c.JID); tex != nil {
 		avatar.SetCustomImage(tex)
 	}
@@ -217,13 +217,15 @@ func (l *ChatList) rowContent(c store.Chat, name string) gtk.Widgetter {
 		badge.AddCSSClass("unread")
 		bottom.Append(badge)
 	}
-	text := gtk.NewBox(gtk.OrientationVertical, 2)
+	text := gtk.NewBox(gtk.OrientationVertical, 4)
 	text.SetVAlign(gtk.AlignCenter)
 	text.Append(top)
 	text.Append(bottom)
-	row := gtk.NewBox(gtk.OrientationHorizontal, 10)
-	row.SetMarginTop(4)
-	row.SetMarginBottom(4)
+	row := gtk.NewBox(gtk.OrientationHorizontal, 12)
+	row.SetMarginTop(9)
+	row.SetMarginBottom(9)
+	row.SetMarginStart(4)
+	row.SetMarginEnd(4)
 	row.Append(avatar)
 	row.Append(text)
 	return row

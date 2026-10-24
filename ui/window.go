@@ -101,6 +101,9 @@ func New(app *adw.Application, c *wa.Client) *Window {
 	w.split.SetSidebar(adw.NewNavigationPage(w.chats.root, "Chats"))
 	w.split.SetContent(adw.NewNavigationPage(w.conv.root, "Chat"))
 	w.split.SetVExpand(true)
+	w.split.SetMinSidebarWidth(320) // libadwaita's 180-280 px default crams names and previews
+	w.split.SetMaxSidebarWidth(420)
+	w.split.SetSidebarWidthFraction(0.3)
 	w.banner = adw.NewBanner("Connecting…")
 	w.banner.SetRevealed(true) // until the first Connected
 	w.main = gtk.NewBox(gtk.OrientationVertical, 0)
@@ -226,12 +229,14 @@ func (w *Window) notify(e wa.Event) {
 		body = w.c.Name(m.Sender) + ": " + body
 	}
 	go func() {
-		icon := w.c.Avatar(e.Chat)
-		if icon == "" {
-			icon = "lin-whatsapp-native"
+		args := []string{"-a", "WhatsApp", "-i", "lin-whatsapp-native", "-A", "default=Open"}
+		// The picture goes in the image-path hint: shells such as quickshell
+		// show it large, while -i is only the small app icon.
+		if pic := w.c.Avatar(e.Chat); pic != "" {
+			args = append(args, "-h", "string:image-path:file://"+pic)
 		}
-		out, err := exec.CommandContext(context.Background(), "notify-send", "-a", "WhatsApp",
-			"-i", icon, "-A", "default=Open", title, body).Output()
+		out, err := exec.CommandContext(context.Background(), "notify-send",
+			append(args, title, body)...).Output()
 		if err == nil && strings.TrimSpace(string(out)) == "default" {
 			glib.IdleAdd(func() {
 				w.openChat(e.Chat)
